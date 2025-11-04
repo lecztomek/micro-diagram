@@ -1,117 +1,81 @@
-import React, { useEffect, useMemo, useState, useCallback, useRef } from "react";
-import ReactFlow, {
-  Background,
-  Controls,
-  MiniMap,
-  MarkerType,
-  useEdgesState,
-  useNodesState,
-  Position,
-} from "reactflow";
-import "reactflow/dist/style.css";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 
 /**
- * Mikroserwisy z Prometheusa — ręczne odświeżanie + wybór środowiska (systemName).
- * - Filtrujemy wyłącznie serie z systemName = wybrana wartość (prod/qa/qa2).
- * - Brak auto-odświeżania w interwale.
+ * Widok kolumnowy (bez strzałek):
+ * - kol.1: rooty (węzły, które NIGDY nie są targetem)
+ * - klik w kol.1 → kol.2: bezpośrednie zależności root’a
+ * - klik w kol.2 → kol.3: bezpośrednie zależności wybranego z kol.2
+ * - ... i tak dalej (ścieżka wyboru = selections[])
+ * - wiersze w kolumnach pokazują label (z wersją) + metryki dla krawędzi z rodzicem (jeśli jest)
+ * - filtr po systemName (prod/qa/qa2), ręczne „Odśwież”, brak auto-intervalu
  */
 
-const STORAGE_KEY = "microservices-layout-v1";
-
-/* === KONFIG PROMETHEUSA === */
 const PROM_URL = "http://192.168.106.118:9090/api/v1/query"; // ⬅️ PODMIEŃ
 const PROM_HEADERS: HeadersInit = {
-  // Authorization: `Bearer ${TOKEN}`, // ⬅️ jeśli potrzebujesz
+  // Authorization: `Bearer ${TOKEN}`,
 };
 
-/* === Wygląd krawędzi === */
-function edgeColor(errorRate: number) {
-  if (errorRate > 0.1) return "#dc2626";
-  if (errorRate > 0.05) return "#f97316";
-  if (errorRate > 0.01) return "#eab308";
-  return "#16a34a";
-}
-function edgeWidth(rps: number) {
-  return 0.75 + Math.log10(Math.max(1, rps)) * 1.3;
-}
+const WINDOW_OPTIONS = [
+  { label: "1m", rps: "1m", err: "1m", p95: "5m" },
+  { label: "5m", rps: "5m", err: "5m", p95: "10m" },
+  { label: "15m", rps: "15m", err: "15m", p95: "15m" },
+] as const;
 
-/* === Normalizacja/ID/etykiety === */
-function norm(s?: string) {
-  return (s ?? "").trim().toLowerCase();
-}
-function appendVersion(label: string, verRaw?: string) {
-  const ver = (verRaw ?? "").trim();
-  return ver ? `${label} (v${ver})` : label;
-}
 
-// ID źródła: separator '::' (żeby kropka w nazwie nie była separatorem)
-function makeSourceId(m: any) {
-  const g = norm(m?.sourceServiceGroupName);
-  const n = norm(m?.sourceServiceName);
-  return g ? `${g}::${n}` : n;
-}
-// Label źródła: ładnie z kropką + wersja
-function makeSourceLabel(m: any) {
-  const gRaw = (m?.sourceServiceGroupName ?? "").trim();
-  const nRaw = (m?.sourceServiceName ?? "").trim();
-  const base = gRaw ? `${gRaw}.${nRaw}` : nRaw;
-  return appendVersion(base, (m?.sourceServiceVersion ?? "").trim());
-}
-
-// Target ID/LABEL — jak w danych (ID bez lowercasa, label + wersja)
-function makeTargetId(m: any) {
-  return (m?.targetServiceName ?? "").trim();
-}
-function makeTargetLabel(m: any) {
-  const base = (m?.targetServiceName ?? "").trim();
-  return appendVersion(base, (m?.targetServiceVersion ?? "").trim());
-}
-
-// Edge ID łączymy po '->' na bazie ID (techniczny, stabilny)
-function makeEdgeId(m: any) {
-  return `${makeSourceId(m)}->${makeTargetId(m)}`;
-}
-
-/* === Typy === */
 type EdgeId = string;
 type NodeId = string;
-type Metrics = Record<EdgeId, { rps: number; errorRate: number; p95?: number }>;
+
 type Graph = {
   nodeIds: NodeId[];
-  nodeLabels: Record<NodeId, string>;
-  metricsByEdge: Metrics;
-  edgesSeen: EdgeId[];
+  nodeLabels: Record<NodeId, string>;                // id → label (z wersją)
+  edgesSeen: EdgeId[];                                // "sourceId->targetId"
+  metricsByEdge: Record<EdgeId, { rps: number; errorRate: number; p95?: number }>;
 };
 
-/* === Budowa zapytań PromQL z filtrem systemName === */
-function buildQueries(env: string) {
+/* --------------------- PromQL builder (z filtrem po systemName) --------------------- */
+
+function buildQueries(env: string, p95Win = "10m") {
   const matcher = `{systemName="${env}"}`;
-  // Count/RPS
-  const Q_RPS = `
-    sum by (sourceServiceName, sourceServiceGroupName, targetServiceName) (
-      rate(xsp_proxy_request_duration_miliseconds_count${matcher}[1m])
+  const GROUP_BY = "(executableName, executableGroupName, executableVersion, targetServiceName, targetServiceVersion)";
+
+  // Wszystkie wywołania w "ostatniej minucie" (Twoja metryka już tak raportuje)
+  const Q_TOTAL = `
+    sum by ${GROUP_BY} (
+      xsp_proxy_request_duration_miliseconds_count${matcher}
     )
   `;
-  // Errors 5xx
-  const Q_ERR = `
-    sum by (sourceServiceName, sourceServiceGroupName, targetServiceName) (
-      rate(xsp_proxy_request_duration_miliseconds_count${matcher}{status=~"5.."}[1m])
-    )
-  `.replace(`${matcher}{`, `{systemName="${env}",`); // wstawiamy systemName razem z innymi matcherami
 
-  // P95 z histogramu
+  // Tylko sukcesy (HTTP 200) w "ostatniej minucie"
+  const Q_OK = `
+    sum by ${GROUP_BY} (
+      xsp_proxy_request_duration_miliseconds_count{systemName="${env}",status="200"}
+    )
+  `;
+
+  // p95 – jak wcześniej
   const Q_P95 = `
     histogram_quantile(
       0.95,
-      sum by (le, sourceServiceName, sourceServiceGroupName, targetServiceName) (
-        rate(xsp_proxy_request_duration_miliseconds_bucket${matcher}[5m])
+      sum by (le, executableName, executableGroupName, executableVersion, targetServiceName, targetServiceVersion) (
+        rate(xsp_proxy_request_duration_miliseconds_bucket${matcher}[${p95Win}])
       )
     )
   `;
-  return { Q_RPS, Q_ERR, Q_P95 };
+  return { Q_TOTAL, Q_OK, Q_P95 };
 }
 
-/* === Prometheus fetch === */
+
+function getSrcGroup(m: any) {
+  return m?.executableGroupName ?? m?.sourceServiceGroupName;
+}
+function getSrcName(m: any) {
+  return m?.executableName ?? m?.sourceServiceName;
+}
+function getSrcVersion(m: any) {
+  return m?.executableVersion ?? m?.sourceServiceVersion;
+}
+
+
 async function promQuery(query: string) {
   const res = await fetch(`${PROM_URL}?query=${encodeURIComponent(query)}`, { headers: PROM_HEADERS });
   if (!res.ok) throw new Error(`Prometheus HTTP ${res.status}`);
@@ -120,442 +84,394 @@ async function promQuery(query: string) {
   return json.data?.result ?? [];
 }
 
-async function fetchGraphFromProm(env: string): Promise<Graph> {
-  const { Q_RPS, Q_ERR, Q_P95 } = buildQueries(env);
+/* --------------------- Normalizacja i identyfikatory --------------------- */
 
-  const [rpsVec, errVec, p95Vec] = await Promise.all([
-    promQuery(Q_RPS),
-    promQuery(Q_ERR),
-    promQuery(Q_P95).catch(() => []), // p95 opcjonalne
+function norm(s?: string) {
+  return (s ?? "").trim().toLowerCase();
+}
+
+function appendVersion(label: string, verRaw?: string) {
+  const ver = (verRaw ?? "").trim();
+  return ver ? `${label} (v${ver})` : label;
+}
+
+// SOURCE: techniczne ID = 'group::name' (lowercase), label = "group.name (vX)" (lowercase)
+function makeSourceId(m: any) {
+  const g = norm(getSrcGroup(m));
+  const n = norm(getSrcName(m));
+  return g ? `${g}::${n}` : n;
+}
+
+function normalizeVersion3(raw?: string) {
+  const s = (raw ?? "").trim();
+  if (!s) return "";
+  // wyciągamy tylko liczby, separowane czymkolwiek (., -, _, spacje)
+  const parts = s.split(/[^\d]+/).filter(Boolean).map(x => String(parseInt(x, 10)));
+  if (parts.length === 0) return "";
+  while (parts.length < 3) parts.push("0");     // dopełnij do 3
+  return parts.slice(0, 3).join(".");           // utnij do 3
+}
+
+
+function makeSourceLabel(m: any) {
+  const g = norm(getSrcGroup(m)); // lowercase
+  const n = norm(getSrcName(m));  // lowercase
+  const base = g ? `${g}.${n}` : n;
+  const ver = normalizeVersion3(getSrcVersion(m));
+  return appendVersion(base, ver);
+}
+
+const DEFAULT_GROUP = "default";
+
+function makeTargetId(m: any) {
+  const g = norm(DEFAULT_GROUP);                // "default"
+  const n = norm(m?.targetServiceName);
+  return n ? `${g}::${n}` : n;                  // "default::liftams.eventtracking.filetransfer.loops"
+}
+
+function makeTargetLabel(m: any) {
+  const base = (m?.targetServiceName ?? "").trim();
+  return appendVersion(base, (m?.targetServiceVersion ?? "").trim());
+}
+
+/* --------------------- Pobranie całego grafu z Prometheusa --------------------- */
+
+async function fetchGraphFromProm(env: string, p95Win = "10m"): Promise<Graph> {
+  const { Q_TOTAL, Q_OK, Q_P95 } = buildQueries(env, p95Win);
+  const [totalVec, okVec, p95Vec] = await Promise.all([
+    promQuery(Q_TOTAL),
+    promQuery(Q_OK),
+    promQuery(Q_P95).catch(() => []),
   ]);
 
-  const rpsMap = new Map<EdgeId, number>();
-  const errMap = new Map<EdgeId, number>();
-  const p95Map = new Map<EdgeId, number>();
+  const totalMap = new Map<EdgeId, number>();
+  const okMap    = new Map<EdgeId, number>();
+  const p95Map   = new Map<EdgeId, number>();
   const nodes = new Set<NodeId>();
   const edges = new Set<EdgeId>();
   const nodeLabels: Record<NodeId, string> = {};
 
   const collect = (vec: any[], sink: Map<EdgeId, number> | null) => {
     for (const s of vec) {
-      const metric = s.metric ?? {};
-      const edgeId = makeEdgeId(metric);
-      const srcId = makeSourceId(metric);
-      const tgtId = makeTargetId(metric);
+      const m = s.metric ?? {};
+      const srcId = makeSourceId(m);
+      const tgtId = makeTargetId(m);
       if (!srcId || !tgtId) continue;
 
-      edges.add(edgeId);
-      nodes.add(srcId);
-      nodes.add(tgtId);
+      const edgeId = `${srcId}->${tgtId}`;
+      edges.add(edgeId); nodes.add(srcId); nodes.add(tgtId);
+      if (!nodeLabels[srcId]) nodeLabels[srcId] = makeSourceLabel(m);
+      if (!nodeLabels[tgtId]) nodeLabels[tgtId] = makeTargetLabel(m);
 
-      if (!nodeLabels[srcId]) nodeLabels[srcId] = makeSourceLabel(metric);
-      if (!nodeLabels[tgtId]) nodeLabels[tgtId] = makeTargetLabel(metric);
-
-      if (sink) sink.set(edgeId, Number(s.value?.[1] ?? 0));
+      if (sink) sink.set(edgeId, Number(s.value?.[1] ?? 0)); // calls in last minute
     }
   };
 
-  collect(rpsVec, rpsMap);
-  collect(errVec, errMap);
-  collect(p95Vec, p95Map);
+  collect(totalVec, totalMap);
+  collect(okVec,    okMap);
+  collect(p95Vec,   p95Map);
 
-  const metricsByEdge: Metrics = {};
+  const metricsByEdge: Graph["metricsByEdge"] = {};
   for (const id of edges) {
-    const rps = rpsMap.get(id) ?? 0;
-    const errs = errMap.get(id) ?? 0;
-    const errorRate = rps > 0 ? Math.min(0.4, errs / rps) : 0;
+    const total = totalMap.get(id) ?? 0;
+    const ok    = okMap.get(id);
+    // jeśli brakuje serii OK dla tej krawędzi, traktujemy to jak ok=0 (wszystko błędy)
+    const okSafe = ok !== undefined ? ok : 0;
+
+    const errs = Math.max(0, total - okSafe);
+    const rps  = total / 60;
+    const errorRate = total > 0 ? Math.min(1, errs / total) : 0;
     const p95 = p95Map.get(id);
+
     metricsByEdge[id] = { rps: Math.round(rps), errorRate, ...(p95 !== undefined ? { p95 } : {}) };
   }
 
-  return {
-    nodeIds: Array.from(nodes),
-    nodeLabels,
-    metricsByEdge,
-    edgesSeen: Array.from(edges),
-  };
+  return { nodeIds: Array.from(nodes), nodeLabels, edgesSeen: Array.from(edges), metricsByEdge };
 }
 
-/* === Auto-layout dla nowych węzłów (siatka) === */
-const GRID: [number, number] = [20, 20];
-function autoPositionFor(index: number): { x: number; y: number } {
-  const colWidth = 260;
-  const rowHeight = 140;
-  const col = index % 5;
-  const row = Math.floor(index / 5);
-  return { x: 80 + col * colWidth, y: 60 + row * rowHeight };
+
+/* --------------------- Pomocnicze: rooty, adjacency, metryki dla par --------------------- */
+
+function computeTargets(edgesSeen: EdgeId[]): Set<NodeId> {
+  const targets = new Set<NodeId>();
+  for (const e of edgesSeen) {
+    const [, t] = e.split("->");
+    targets.add(t);
+  }
+  return targets;
 }
 
-/* === Komponent === */
+function computeRoots(g: Graph): NodeId[] {
+  const targets = computeTargets(g.edgesSeen);
+  return g.nodeIds.filter((n) => !targets.has(n));
+}
+
+function buildAdjacency(g: Graph): Map<NodeId, NodeId[]> {
+  const adj = new Map<NodeId, NodeId[]>();
+  for (const eid of g.edgesSeen) {
+    const [s, t] = eid.split("->");
+    if (!adj.has(s)) adj.set(s, []);
+    adj.get(s)!.push(t);
+  }
+  // deduplikacja, sort wg „ważności” (err% desc, rps desc) jeśli mamy metryki dla znanego rodzica
+  for (const [s, list] of adj) {
+    const unique = Array.from(new Set(list));
+    adj.set(s, unique);
+  }
+  return adj;
+}
+
+function edgeKey(parent: NodeId | null, child: NodeId): EdgeId | null {
+  return parent ? `${parent}->${child}` : null;
+}
+
+/* --------------------- UI helpers --------------------- */
+
+function severityColor(errorRate: number): string {
+  if (errorRate > 0.1) return "#dc2626"; // czerwony
+  if (errorRate > 0.05) return "#f97316"; // pomarańczowy
+  if (errorRate > 0.01) return "#eab308"; // żółty
+  return "#16a34a"; // zielony
+}
+
 const ENV_OPTIONS = ["prod", "qa", "qa2"] as const;
 type Env = typeof ENV_OPTIONS[number];
 
-export default function MicroservicesDiagram() {
+const STRIPE_W = 6; // szerokość pionowej kreski w px
+
+function worstChildErrorRate(
+  parent: NodeId,
+  adj: Map<NodeId, NodeId[]>,
+  metrics: Graph["metricsByEdge"]
+): number {
+  const children = Array.from(new Set(adj.get(parent) ?? []));
+  if (children.length === 0) return 0;
+  let maxErr = 0;
+  for (const c of children) {
+    const m = metrics[`${parent}->${c}`];
+    if (m && m.errorRate > maxErr) maxErr = m.errorRate;
+  }
+  return maxErr;
+}
+
+
+/* =========================================================================================
+ *  KOMPONENT
+ * =======================================================================================*/
+export default function MicroservicesColumns() {
   const [env, setEnv] = useState<Env>("prod");
-  const [graph, setGraph] = useState<Graph>({ nodeIds: [], nodeLabels: {}, metricsByEdge: {}, edgesSeen: [] });
+  const [graph, setGraph] = useState<Graph>({ nodeIds: [], nodeLabels: {}, edgesSeen: [], metricsByEdge: {} });
 
-  // Fallback input (import/eksport layoutu z pliku)
-  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  // selections[i] = id wybranego węzła w kolumnie i (0-based)
+  const [selections, setSelections] = useState<NodeId[]>([]);
+  const [winIdx, setWinIdx] = useState(1); // domyślnie 5m
 
-  // Wczytaj zapisany układ przy starcie
-  const savedLayout = useMemo(() => {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return null;
-      return JSON.parse(raw) as Record<string, { x: number; y: number }>;
-    } catch {
-      return null;
-    }
-  }, []);
+  const roots = useMemo(() => computeRoots(graph), [graph]);
+  const adj = useMemo(() => buildAdjacency(graph), [graph]);
 
-  // Pierwszy fetch (dla domyślnego env)
   useEffect(() => {
-    fetchGraphFromProm(env)
-      .then(setGraph)
-      .catch((e) => console.error("Prometheus fetch failed", e));
-  }, []); // tylko raz na starcie
+    const w = WINDOW_OPTIONS[winIdx];
+    fetchGraphFromProm(env, w.p95)
+      .then((g) => { setGraph(g); setSelections([]); })
+      .catch((e) => { console.error(e); alert("Nie udało się pobrać danych z Prometheusa."); });
+  }, [env, winIdx]);
 
-  // Fetch po zmianie środowiska (to Twoja akcja, nie auto-refresh w tle)
-  useEffect(() => {
-    // pomijamy pierwsze wywołanie z hooka powyżej — ale jeśli zostawimy,
-    // to i tak zadziała poprawnie (dwa fetch-e dla 'prod' nie zrobią problemu).
-    fetchGraphFromProm(env)
-      .then(setGraph)
-      .catch((e) => {
-        console.error("Prometheus fetch failed", e);
-        alert("Nie udało się pobrać danych z Prometheusa dla wybranego środowiska.");
-      });
-  }, [env]);
-
-  // Ręczne odświeżanie (przycisk)
-  const refreshGraph = useCallback(async () => {
+  const refresh = useCallback(async () => {
     try {
-      const g = await fetchGraphFromProm(env);
+      const w = WINDOW_OPTIONS[winIdx];
+      const g = await fetchGraphFromProm(env, w.p95);
       setGraph(g);
     } catch (e) {
-      console.error("Prometheus fetch failed", e);
+      console.error(e);
       alert("Nie udało się pobrać danych z Prometheusa.");
     }
-  }, [env]);
+  }, [env, winIdx]);
 
-  // Budowa NODES (z etykietami + layout). Zawijanie/nadawanie szerokości.
-  const initialNodes = useMemo(() => {
-    return graph.nodeIds.map((nodeId, idx) => {
-      const pos = savedLayout?.[nodeId] ?? autoPositionFor(idx);
-      const label = graph.nodeLabels?.[nodeId] ?? nodeId;
 
-      return {
-        id: nodeId,
-        type: "default",
-        data: { label },
-        position: pos,
-        draggable: true,
-        sourcePosition: Position.Right,
-        targetPosition: Position.Left,
-        style: {
-          padding: "10px 12px",
-          borderRadius: 12,
-          border: "1px solid #e5e7eb",
-          boxShadow: "0 2px 8px rgba(0,0,0,0.06)",
-          background: "white",
-          fontSize: 13,
-          fontWeight: 600,
-          maxWidth: 240,
-          width: "auto",
-          whiteSpace: "normal",
-          wordBreak: "break-word",
-        } as React.CSSProperties,
-      };
-    });
-  }, [graph.nodeIds, graph.nodeLabels, savedLayout]);
+  // oblicz listę kolumn: [roots] + deps(selections[0]) + deps(selections[1]) + ...
+  const columns: NodeId[][] = useMemo(() => {
+    const result: NodeId[][] = [];
+    result.push(roots);
 
-  // Budowa EDGES (z metrykami)
-  const initialEdges = useMemo(() => {
-    return graph.edgesSeen.map((edgeId) => {
-      const [sourceId, targetId] = edgeId.split("->");
-      const m = graph.metricsByEdge[edgeId] ?? { rps: 0, errorRate: 0 as number, p95: undefined as number | undefined };
-      const labelCore = `${(m.errorRate * 100).toFixed(1)}% • ${m.rps} rps`;
-      const label = m.p95 !== undefined ? `${labelCore} • p95=${m.p95.toFixed(0)}ms` : labelCore;
+    for (let i = 0; i < selections.length; i++) {
+      const parent = selections[i];
+      const children = Array.from(new Set(adj.get(parent) ?? []));
 
-      return {
-        id: edgeId,
-        source: sourceId,
-        target: targetId,
-        type: "smoothstep",
-        label,
-        animated: m.errorRate > 0.05,
-        markerEnd: { type: MarkerType.ArrowClosed, width: 12, height: 12 },
-        style: { stroke: edgeColor(m.errorRate), strokeWidth: edgeWidth(m.rps) },
-        labelStyle: { fontWeight: 700, fontSize: 11, fill: "#111827" },
-        labelBgPadding: [3, 1],
-        labelBgBorderRadius: 6,
-        labelBgStyle: { fill: "#ffffff", fillOpacity: 0.85 },
-      } as any;
-    });
-  }, [graph.edgesSeen, graph.metricsByEdge]);
+      // sort: najpierw problematyczne (errorRate desc), potem RPS desc, potem alfa
+      children.sort((a, b) => {
+        const ea = graph.metricsByEdge[`${parent}->${a}`]?.errorRate ?? 0;
+        const eb = graph.metricsByEdge[`${parent}->${b}`]?.errorRate ?? 0;
+        if (eb !== ea) return eb - ea;
+        const ra = graph.metricsByEdge[`${parent}->${a}`]?.rps ?? 0;
+        const rb = graph.metricsByEdge[`${parent}->${b}`]?.rps ?? 0;
+        if (rb !== ra) return rb - ra;
+        const la = (graph.nodeLabels[a] ?? a).toLowerCase();
+        const lb = (graph.nodeLabels[b] ?? b).toLowerCase();
+        return la.localeCompare(lb);
+      });
 
-  // Stany React Flow
-  const [nodes, setNodes, onNodesChange] = useNodesState(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-
-  // Podmiana struktury przy zmianie grafu (po zmianie env lub po odświeżeniu)
-  useEffect(() => {
-    setNodes(initialNodes);
-    setEdges(initialEdges);
-  }, [initialNodes, initialEdges, setNodes, setEdges]);
-
-  // Aktualizacja etykiet/stylów krawędzi przy zmianie metryk
-  useEffect(() => {
-    setEdges((eds) =>
-      eds.map((e) => {
-        const m = graph.metricsByEdge[e.id];
-        if (!m) return e;
-        const labelCore = `${(m.errorRate * 100).toFixed(1)}% • ${m.rps} rps`;
-        const label = m.p95 !== undefined ? `${labelCore} • p95=${m.p95.toFixed(0)}ms` : labelCore;
-        return {
-          ...e,
-          label,
-          animated: m.errorRate > 0.05,
-          style: { ...(e.style || {}), stroke: edgeColor(m.errorRate), strokeWidth: edgeWidth(m.rps) },
-        };
-      })
-    );
-  }, [graph.metricsByEdge, setEdges]);
-
-  /* === Zapis/odczyt layoutu === */
-  const supportsFS = () =>
-    typeof window !== "undefined" &&
-    // @ts-ignore
-    !!(window.showOpenFilePicker && window.showSaveFilePicker);
-
-  async function loadLayoutViaPicker() {
-    // @ts-ignore
-    const [handle] = await window.showOpenFilePicker({
-      types: [{ description: "Layout JSON", accept: { "application/json": [".json"] } }],
-      multiple: false,
-    });
-    const file = await handle.getFile();
-    const text = await file.text();
-    return JSON.parse(text) as Record<string, { x: number; y: number }>;
-  }
-
-  async function saveLayoutViaPicker(layout: Record<string, { x: number; y: number }>) {
-    // @ts-ignore
-    const handle = await window.showSaveFilePicker({
-      suggestedName: "microservices-layout.json",
-      types: [{ description: "Layout JSON", accept: { "application/json": [".json"] } }],
-    });
-    const writable = await handle.createWritable();
-    await writable.write(new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" }));
-    await writable.close();
-  }
-
-  function downloadFallback(layout: Record<string, { x: number; y: number }>) {
-    const blob = new Blob([JSON.stringify(layout, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "microservices-layout.json";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-  }
-
-  const extractLayout = useCallback(() => {
-    const layout: Record<string, { x: number; y: number }> = {};
-    for (const n of nodes) layout[n.id] = { x: Math.round(n.position.x), y: Math.round(n.position.y) };
-    return layout;
-  }, [nodes]);
-
-  const saveLayoutLocal = useCallback(() => {
-    const layout = extractLayout();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
-  }, [extractLayout]);
-
-  const applyLayout = useCallback(
-    (layout: Record<string, { x: number; y: number }>) => {
-      if (!layout) return;
-      setNodes((nds) =>
-        nds.map((n) => ({
-          ...n,
-          position: layout[n.id] ?? n.position,
-        }))
-      );
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(layout));
-    },
-    [setNodes]
-  );
-
-  const resetLayout = useCallback(() => {
-    localStorage.removeItem(STORAGE_KEY);
-    setNodes((nds) =>
-      nds.map((n, idx) => ({
-        ...n,
-        position: autoPositionFor(idx),
-      }))
-    );
-  }, [setNodes]);
-
-  const saveLayoutToDisk = useCallback(async () => {
-    const layout = extractLayout();
-    try {
-      if (supportsFS()) {
-        await saveLayoutViaPicker(layout);
-      } else {
-        downloadFallback(layout);
-      }
-    } catch (e) {
-      console.error("save to disk error", e);
-      alert("Nie udało się zapisać pliku.");
+      result.push(children);
     }
-  }, [extractLayout]);
+    return result;
+  }, [roots, adj, selections, graph.metricsByEdge, graph.nodeLabels]);
 
-  const loadLayoutFromDisk = useCallback(async () => {
-    try {
-      if (supportsFS()) {
-        const layout = await loadLayoutViaPicker();
-        applyLayout(layout);
-      } else {
-        fileInputRef.current?.click();
-      }
-    } catch (e) {
-      console.error("load from disk error", e);
-      alert("Nie udało się wczytać pliku.");
-    }
-  }, [applyLayout]);
+  // kliknięcie elementu w kolumnie `colIdx`
+  const onSelect = (colIdx: number, nodeId: NodeId) => {
+    const next = selections.slice(0, colIdx); // ucinamy głębsze wybory
+    next[colIdx] = nodeId;
+    setSelections(next);
+  };
 
-  const onFilePicked = useCallback(
-    async (ev: React.ChangeEvent<HTMLInputElement>) => {
-      const file = ev.target.files?.[0];
-      if (!file) return;
-      try {
-        const text = await file.text();
-        const layout = JSON.parse(text) as Record<string, { x: number; y: number }>;
-        applyLayout(layout);
-      } catch (e) {
-        console.error("parse layout error", e);
-        alert("Błędny plik layoutu.");
-      } finally {
-        ev.target.value = "";
-      }
-    },
-    [applyLayout]
-  );
+  // styl kolumny i elementu
+  const columnStyle: React.CSSProperties = {
+    minWidth: 260,
+    maxWidth: 320,
+    height: "calc(90vh - 88px)",
+    overflowY: "auto",
+    borderRight: "1px solid #e5e7eb",
+    padding: 12,
+  };
 
-  /* === UI === */
-  const Legend = () => (
-    <div
-      style={{
-        position: "fixed",
-        right: 16,
-        top: 16,
-        zIndex: 50,
-        background: "rgba(255,255,255,0.9)",
-        backdropFilter: "blur(4px)",
-        borderRadius: 16,
-        boxShadow: "0 6px 20px rgba(0,0,0,0.08)",
-        padding: 12,
-        fontSize: 13,
-        lineHeight: 1.3,
-      }}
-    >
-      <div style={{ fontWeight: 600, marginBottom: 8 }}>Legenda</div>
-      <div>
-        <div>Kolor krawędzi = error rate</div>
-        <div>Grubość krawędzi = RPS</div>
-        <div>Przeciągnij węzeł, aby zmienić układ</div>
-        <div>Siatka 20×20 (snap)</div>
+  const itemStyle = (selected: boolean): React.CSSProperties => ({
+    position: "relative",            // ⬅️ potrzebne dla paska
+    display: "flex",
+    flexDirection: "column",
+    gap: 4,
+    padding: "10px 12px",
+    paddingRight: 12 + STRIPE_W,     // ⬅️ żeby treść nie nachodziła na pasek
+    borderRadius: 12,
+    border: selected ? "2px solid #ef4444" : "1px solid #e5e7eb",
+    background: "#fff",
+    cursor: "pointer",
+    boxShadow: selected ? "0 2px 8px rgba(239,68,68,0.2)" : "0 2px 8px rgba(0,0,0,0.06)",
+    marginBottom: 8,
+  });
+
+
+  // render metryk dla pary (rodzic → element)
+  function MetricsLine({ parent, child }: { parent: NodeId | null; child: NodeId }) {
+    const key = edgeKey(parent, child);
+    if (!key) return null;
+    const m = graph.metricsByEdge[key];
+    if (!m) return null;
+
+    const color = severityColor(m.errorRate);
+    const err = (m.errorRate * 100).toFixed(1);
+    const rps = m.rps;
+    const p95 = m.p95 !== undefined ? ` • p95=${m.p95.toFixed(0)}ms` : "";
+    return (
+      <div style={{ fontSize: 12, color: "#374151" }}>
+        <span style={{ display: "inline-block", width: 10, height: 10, borderRadius: 6, background: color, marginRight: 6 }} />
+        {err}% • {rps} rps{p95}
       </div>
-    </div>
-  );
-
-  const Toolbar = () => (
-    <div style={{ position: "fixed", left: 16, top: 16, zIndex: 50, display: "flex", gap: 8, flexWrap: "wrap", alignItems: "center" }}>
-      <label style={{ fontSize: 13, fontWeight: 600, marginRight: 4 }}>Środowisko:</label>
-      <select
-        value={env}
-        onChange={(e) => setEnv(e.target.value as Env)}
-        style={{
-          padding: "8px 10px",
-          borderRadius: 12,
-          border: "1px solid #e5e7eb",
-          background: "#fff",
-          fontSize: 13,
-          cursor: "pointer",
-        }}
-        title="Filtruj po systemName"
-      >
-        {ENV_OPTIONS.map((opt) => (
-          <option key={opt} value={opt}>{opt}</option>
-        ))}
-      </select>
-
-      <button
-        onClick={refreshGraph}
-        style={{ padding: "8px 14px", borderRadius: 16, background: "#0ea5e9", color: "#fff", border: "none", cursor: "pointer", marginLeft: 8 }}
-        title="Pobierz metryki z Prometheusa (ręcznie)"
-      >
-        Odśwież
-      </button>
-
-      <div style={{ width: 1, height: 24, background: "#d1d5db", margin: "0 8px" }} />
-
-      <button
-        onClick={saveLayoutLocal}
-        style={{ padding: "8px 14px", borderRadius: 16, background: "#111", color: "#fff", border: "none", cursor: "pointer" }}
-        title="Zapisz aktualny układ do localStorage"
-      >
-        Zapisz (przeglądarka)
-      </button>
-      <button
-        onClick={resetLayout}
-        style={{ padding: "8px 14px", borderRadius: 16, background: "#fff", color: "#111", border: "1px solid #e5e7eb", cursor: "pointer" }}
-        title="Przywróć auto-layout"
-      >
-        Reset
-      </button>
-      <div style={{ width: 1, height: 24, background: "#d1d5db", margin: "0 8px" }} />
-      <button
-        onClick={loadLayoutFromDisk}
-        style={{ padding: "8px 14px", borderRadius: 16, background: "#fff", color: "#111", border: "1px solid #e5e7eb", cursor: "pointer" }}
-        title="Wczytaj układ z pliku (.json)"
-      >
-        Wczytaj z pliku…
-      </button>
-      <button
-        onClick={saveLayoutToDisk}
-        style={{ padding: "8px 14px", borderRadius: 16, background: "#fff", color: "#111", border: "1px solid #e5e7eb", cursor: "pointer" }}
-        title="Zapisz układ do pliku (.json)"
-      >
-        Zapisz do pliku…
-      </button>
-      <input ref={fileInputRef} type="file" accept="application/json" onChange={onFilePicked} style={{ display: "none" }} />
-    </div>
-  );
+    );
+  }
 
   return (
-    <div style={{ width: "100%", height: "90vh", background: "#f9fafb", borderRadius: 16, overflow: "hidden", position: "relative" }}>
-      <Toolbar />
-      <Legend />
-      <ReactFlow
-        style={{ width: "100%", height: "100%" }}
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        fitView
-        snapToGrid
-        snapGrid={GRID}
-        nodesDraggable
-        nodesConnectable={false}
-        elevateEdgesOnSelect
-        proOptions={{ hideAttribution: true }}
-      >
-        <Background gap={20} />
-        <MiniMap pannable zoomable />
-        <Controls showInteractive={false} />
-      </ReactFlow>
+    <div style={{ width: "100%", height: "100%", background: "#f9fafb" }}>
+      {/* Toolbar */}
+      <div style={{ position: "sticky", top: 0, zIndex: 10, background: "#f9fafb", padding: 12, display: "flex", gap: 8, alignItems: "center", borderBottom: "1px solid #e5e7eb" }}>
+        <label style={{ fontSize: 13, fontWeight: 600 }}>Środowisko:</label>
+        <select
+          value={env}
+          onChange={(e) => setEnv(e.target.value as Env)}
+          style={{ padding: "8px 10px", borderRadius: 12, border: "1px solid #e5e7eb", background: "#fff", fontSize: 13, cursor: "pointer" }}
+          title="Filtruj po systemName"
+        >
+          {ENV_OPTIONS.map((opt) => (
+            <option key={opt} value={opt}>{opt}</option>
+          ))}
+        </select>
+
+        <button onClick={refresh} style={{ padding: "8px 14px", borderRadius: 16, background: "#0ea5e9", color: "#fff", border: "none", cursor: "pointer" }}>
+          Odśwież
+        </button>
+        <label style={{ fontSize: 13, fontWeight: 600, marginLeft: 8 }}>Okres:</label>
+       
+        <select
+          value={winIdx}
+          onChange={(e) => setWinIdx(Number(e.target.value))}
+          style={{ padding: "8px 10px", borderRadius: 12, border: "1px solid #e5e7eb", background: "#fff", fontSize: 13, cursor: "pointer" }}
+          title="Okno czasowe dla rate()"
+        >
+          {WINDOW_OPTIONS.map((w, i) => (
+            <option key={w.label} value={i}>{w.label}</option>
+          ))}
+        </select>
+
+
+        {selections.length > 0 && (
+          <button onClick={() => setSelections([])} style={{ padding: "8px 14px", borderRadius: 16, background: "#111", color: "#fff", border: "none", cursor: "pointer" }}>
+            ← Wróć do rootów
+          </button>
+        )}
+      </div>
+
+      {/* Kolumny */}
+      <div style={{ display: "grid", gridAutoFlow: "column", gridAutoColumns: "minmax(260px, 320px)", gap: 12, padding: 12 }}>
+        {columns.map((items, colIdx) => {
+          const parent = colIdx === 0 ? null : selections[colIdx - 1];
+          const selectedId = selections[colIdx] ?? null;
+
+          return (
+            <div key={colIdx} style={columnStyle}>
+              {colIdx === 0 ? (
+                <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>Rooty</div>
+              ) : (
+                <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>
+                  Zależności {graph.nodeLabels[parent!] ?? parent}
+                </div>
+              )}
+
+              {items.length === 0 && (
+                <div style={{ fontSize: 13, color: "#6b7280" }}>Brak elementów</div>
+              )}
+
+              {items.map((id) => {
+                const label = graph.nodeLabels[id] ?? id;
+                const isSelected = selectedId === id;
+
+                // czy ma dzieci → licz max error i kolor paska
+                const hasChildren = (adj.get(id)?.length ?? 0) > 0;
+                const stripeColor = hasChildren
+                  ? severityColor(worstChildErrorRate(id, adj, graph.metricsByEdge))
+                  : null;
+
+                return (
+                  <div
+                    key={id}
+                    style={itemStyle(isSelected)}
+                    onClick={() => onSelect(colIdx, id)}
+                    title={label}
+                  >
+                    {/* pasek po prawej, przez całą wysokość kafelka */}
+                    {stripeColor && (
+                      <div
+                        style={{
+                          position: "absolute",
+                          top: 0,
+                          right: 0,
+                          width: STRIPE_W,
+                          height: "100%",
+                          background: stripeColor,
+                          borderTopRightRadius: 10,
+                          borderBottomRightRadius: 10,
+                        }}
+                      />
+                    )}
+
+                    <div style={{ fontSize: 13, fontWeight: 700, color: "#111827", whiteSpace: "normal", wordBreak: "break-word" }}>
+                      {label}
+                    </div>
+                    <MetricsLine parent={colIdx === 0 ? null : selections[colIdx - 1]} child={id} />
+                  </div>
+                );
+              })}
+
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
