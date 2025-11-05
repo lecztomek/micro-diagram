@@ -60,3 +60,28 @@ button:focus-visible {
     background-color: #f9f9f9;
   }
 }
+
+/* Ustal stałą szerokość scrolla (Chrome/Edge/Safari) */
+.msd-col::-webkit-scrollbar { width: 8px; height: 8px; }
+.msd-col::-webkit-scrollbar-track { background: transparent; }
+
+/* NIEWIDOCZNY kciuk na co dzień (miejsce jest, ale go nie widać) */
+.msd-col::-webkit-scrollbar-thumb { 
+  background: rgba(0,0,0,0);     /* w pełni przezroczysty */
+  border-radius: 999px;
+}
+
+/* Na hover – lekko pokaż kciuk */
+.msd-col:hover::-webkit-scrollbar-thumb {
+  background: rgba(0,0,0,.18);
+}
+
+/* Firefox – zachowaj miejsce i koloryzuj tylko na hover */
+.msd-col{
+  scrollbar-gutter: stable;                 /* zapobiega „podskokom” */
+  scrollbar-width: thin;                    /* stała cienka szerokość */
+  scrollbar-color: transparent transparent; /* niewidoczny kciuk i tor */
+}
+.msd-col:hover{
+  scrollbar-color: rgba(0,0,0,.18) transparent; /* pokaż kciuk na hover */
+}

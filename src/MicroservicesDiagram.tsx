@@ -73,6 +73,31 @@ function buildQueries(env: string, p95Win = "10m") {
   return { Q_TOTAL, Q_OK, Q_P95 };
 }
 
+// const COLUMN_BORDER = 1;        // masz borderRight: "1px solid ..."
+// const CONNECTOR_OVERHANG = 8;   // ile ma wjechać „w tamtą stronę” (px)
+
+// const THICK_MIN = 3;
+// const THICK_MAX = 14;
+
+const GRID_GAP = 12;     // taki jak w gridzie kolumn
+const COLUMN_PAD = 12;   // taki jak w columnStyle.padding
+
+// function thicknessFromRps(rps: number, relMax: number) {
+//   if (!relMax || !isFinite(relMax)) return THICK_MIN;
+//   const frac = Math.max(0, Math.min(1, rps / relMax));
+//   return Math.round(THICK_MIN + frac * (THICK_MAX - THICK_MIN));
+// }
+
+// function relMaxForSiblings(parentId: NodeId | null, adj: Map<NodeId, NodeId[]>, metrics: Graph["metricsByEdge"]) {
+//   if (!parentId) return 0;
+//   const siblings = Array.from(new Set(adj.get(parentId) ?? []));
+//   return siblings.reduce((acc, s) => {
+//     const mm = metrics[`${parentId}->${s}`];
+//     return Math.max(acc, mm?.rps ?? 0);
+//   }, 0);
+// }
+
+
 
 function getSrcGroup(m: any) {
   return m?.executableGroupName ?? m?.sourceServiceGroupName;
@@ -556,15 +581,18 @@ export default function MicroservicesColumns() {
     setSelections(next);
   };
 
-  // styl kolumny i elementu
   const columnStyle: React.CSSProperties = {
     minWidth: 260,
     maxWidth: 320,
     height: "calc(90vh - 88px)",
     overflowY: "auto",
+    overflowX: "visible",     // ← DODANE: nie przycinaj w poziomie
+    position: "relative",     // ← DODANE: dla zIndex potomków
     borderRight: "1px solid #e5e7eb",
-    padding: 12,
+    padding: COLUMN_PAD,
+    zIndex: 100 
   };
+
 
   const itemStyle = (selected: boolean): React.CSSProperties => ({
     position: "relative",            // ⬅️ potrzebne dla paska
@@ -580,24 +608,6 @@ export default function MicroservicesColumns() {
     boxShadow: selected ? "0 2px 8px rgba(239,68,68,0.2)" : "0 2px 8px rgba(0,0,0,0.06)",
     marginBottom: 8,
   });
-
-
-  // —— MINI LINIA METRYK W KARCIE (RPS + rel. RPS) ——
-  // używana w listach mikroserwisów w kolumnach
-  function MetricsLine({ rps, relMax }: { rps?: number; relMax: number }) {
-    const r = typeof rps === "number" ? rps : 0;
-    return (
-      <div style={{ display: "grid", gridTemplateColumns: "48px 1fr", gap: 8, alignItems: "center" }}>
-        <div style={{ fontSize: 11, color: "#6b7280" }}>RPS</div>
-        <div>
-          <div style={{ fontSize: 13, fontWeight: 700, color: "#111827", lineHeight: 1 }}>{r}</div>
-          <div style={{ marginTop: 6 }}>
-            <RelBar value={r} max={relMax} />
-          </div>
-        </div>
-      </div>
-    );
-  }
 
   return (
     <div style={{ width: "100%", height: "100%", background: "#f9fafb" }}>
@@ -650,13 +660,23 @@ export default function MicroservicesColumns() {
       >
         {/* LEWO: Twoje kolumny */}
         <div>
-          <div style={{ display: "grid", gridAutoFlow: "column", gridAutoColumns: "minmax(260px, 320px)", gap: 12 }}>
+            <div
+              style={{
+                display: "grid",
+                gridAutoFlow: "column",
+                gridAutoColumns: "minmax(260px, 320px)",
+                gap: GRID_GAP,
+                overflow: "visible",      // ← pozwól wychodzić elementom w gap
+                position: "relative",     // ← porządek nakładania
+              }}
+            >
+
             {columns.map((items, colIdx) => {
               const parent = colIdx === 0 ? null : selections[colIdx - 1];
               const selectedId = selections[colIdx] ?? null;
 
               return (
-                <div key={colIdx} style={columnStyle}>
+                <div key={colIdx} style={columnStyle} className="msd-col">
                   {colIdx === 0 ? (
                     <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>
                       Rooty
@@ -680,7 +700,7 @@ export default function MicroservicesColumns() {
 
                     // ★ metryki krawędzi + relMax
                     let edgeMetrics: { rps?: number; errorRate?: number } | undefined;
-                    let relMax = 0;
+                    // let relMax = 0;
 
                     if (colIdx === 0) {
                       stripeErrRate = worstChildErrorRate(id, adj, graph.metricsByEdge);
@@ -689,15 +709,8 @@ export default function MicroservicesColumns() {
                       const mEdge = parentId ? graph.metricsByEdge[`${parentId}->${id}`] : undefined;
                       edgeMetrics = mEdge;
                       stripeErrRate = mEdge?.errorRate ?? 0;
-
-                      // ★ relatywne maksimum RPS wśród „rodzeństwa” dla paska
-                      if (parentId) {
-                        const siblings = Array.from(new Set(adj.get(parentId) ?? []));
-                        relMax = siblings.reduce((acc, s) => {
-                          const mm = graph.metricsByEdge[`${parentId}->${s}`];
-                          return Math.max(acc, mm?.rps ?? 0);
-                        }, 0);
-                      }
+                      // relatywne maksimum wśród rodzeństwa tego samego rodzica (potrzebne do grubości kreski)
+                      //relMax = relMaxForSiblings(parentId ?? null, adj, graph.metricsByEdge);
                     }
 
                     const rawErr = Number.isFinite(stripeErrRate) ? stripeErrRate : 0;
@@ -733,6 +746,56 @@ export default function MicroservicesColumns() {
                           }}
                         />
 
+                        {colIdx >= 1 && edgeMetrics?.rps !== undefined && (() => {
+                          // długość aż do krawędzi między kolumnami (+ delikatne nadbicie)
+                          const CONNECTOR_OVERHANG = 6;   // zwiększ do 10-12, gdybyś chciał „wejść” głębiej
+                          const COLUMN_BORDER = 1;        // masz borderRight: "1px solid ..."
+
+                          // liczymy długość *raz* w JS, żeby nie było żadnych subpikseli po stronie CSS
+                          const connectorWidthPx =
+                            COLUMN_PAD + GRID_GAP + COLUMN_BORDER + CONNECTOR_OVERHANG;
+
+                          // grubość z RPS
+                          const relMax = (() => {
+                            const parentId = selections[colIdx - 1];
+                            if (!parentId) return 0;
+                            const siblings = Array.from(new Set(adj.get(parentId) ?? []));
+                            return siblings.reduce((acc, s) => {
+                              const mm = graph.metricsByEdge[`${parentId}->${s}`];
+                              return Math.max(acc, mm?.rps ?? 0);
+                            }, 0);
+                          })();
+
+                          const thickness = Math.max(3, Math.round(
+                            (edgeMetrics.rps! && relMax)
+                              ? 3 + (edgeMetrics.rps! / relMax) * (14 - 3)
+                              : 3
+                          ));
+
+                          return (
+                            <div
+                              style={{
+                                position: "absolute",
+                                top: "50%",
+                                transform: "translateY(-50%)",
+                                // wariant *beton*: jedziemy w lewo od lewej krawędzi boxa,
+                                // NIE używamy marginów — wszystko w liczbie pikseli
+                                left: -connectorWidthPx,
+                                width: connectorWidthPx,
+                                height: thickness,
+                                background: "#38bdf8",          // niebieski
+                                borderRadius: 999,
+                                boxShadow: "0 0 0 0.5px rgba(0,0,0,0.04)",
+                                zIndex: 999,
+                                pointerEvents: "none",
+                              }}
+                              title={`RPS: ${edgeMetrics.rps}`}
+                            />
+                          );
+                        })()}
+
+
+
                         {/* label */}
                         <div
                           style={{
@@ -745,13 +808,6 @@ export default function MicroservicesColumns() {
                         >
                           {label}
                         </div>
-
-                        {/* ★ pasek rel. RPS tylko dla kolumn >= 1 (tam mamy metryki krawędzi) */}
-                        {colIdx >= 1 && (
-                          <div style={{ marginTop: 6 }}>
-                            <MetricsLine rps={edgeMetrics?.rps} relMax={relMax} />
-                          </div>
-                        )}
                       </div>
                     );
                   })}
