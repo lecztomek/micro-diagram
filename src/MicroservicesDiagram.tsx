@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState, useRef } from "react";
 
 /**
  * Widok kolumnowy (bez strzałek):
@@ -500,6 +500,21 @@ export default function MicroservicesColumns() {
     rawByEdge: {},        // ← to było wymagane przez typ Graph
   });
 
+    // refy do kolumn (scroll containerów) i kafelków (pozycjonowanie)
+  const colRefs = useRef<Record<number, HTMLDivElement | null>>({});
+  const itemRefs = useRef<Record<string, HTMLDivElement | null>>({}); // klucz: `${colIdx}:${nodeId}`
+
+  // mały "tick", żeby wymusić repaint na scroll/resize
+  const [, forceTick] = useState(0);
+
+  // odśwież przy zmianie rozmiaru okna
+  useEffect(() => {
+    const onResize = () => forceTick(t => t + 1);
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+
   // selections[i] = id wybranego węzła w kolumnie i (0-based)
   const [selections, setSelections] = useState<NodeId[]>([]);
   const [winIdx, setWinIdx] = useState(1); // domyślnie 5m
@@ -547,6 +562,23 @@ export default function MicroservicesColumns() {
   }, [env, winIdx]);
 
 
+    // środek Y elementu z kolumny itemColIdx, przeliczony do układu współrzędnych kolumny overlayColIdx
+  function centerYIn(overlayColIdx: number, itemColIdx: number, nodeId: string) {
+    const overlayCol = colRefs.current[overlayColIdx];
+    const itemEl = itemRefs.current[`${itemColIdx}:${nodeId}`];
+    if (!overlayCol || !itemEl) return null;
+    const cr = overlayCol.getBoundingClientRect();
+    const ir = itemEl.getBoundingClientRect();
+    return (ir.top - cr.top) + overlayCol.scrollTop + ir.height / 2;
+  }
+
+  // pełna wysokość contentu kolumny (dla <svg>)
+  function colContentHeight(colIdx: number) {
+    const col = colRefs.current[colIdx];
+    return col ? col.scrollHeight : 0;
+  }
+
+
   // oblicz listę kolumn: [roots] + deps(selections[0]) + deps(selections[1]) + ...
   const columns: NodeId[][] = useMemo(() => {
     const result: NodeId[][] = [];
@@ -574,6 +606,29 @@ export default function MicroservicesColumns() {
     return result;
   }, [roots, adj, selections, graph.metricsByEdge, graph.nodeLabels]);
 
+       // Jeden globalny listener scroll/resize dla wszystkich kolumn
+  useEffect(() => {
+    const tick = () => forceTick(t => t + 1);
+
+    // podepnij do KAŻDEJ aktualnie znanej kolumny
+    const attached: Array<HTMLElement> = [];
+    Object.values(colRefs.current).forEach((el) => {
+      if (el) {
+        el.addEventListener("scroll", tick, { passive: true });
+        attached.push(el);
+      }
+    });
+
+    // resize okna
+    window.addEventListener("resize", tick);
+
+    return () => {
+      attached.forEach((el) => el.removeEventListener("scroll", tick));
+      window.removeEventListener("resize", tick);
+    };
+    // efekt przełączy się gdy zmienia się układ kolumn (selections/columns) albo po refetchu
+  }, [columns.length, selections.join("|")]);
+
   // kliknięcie elementu w kolumnie `colIdx`
   const onSelect = (colIdx: number, nodeId: NodeId) => {
     const next = selections.slice(0, colIdx); // ucinamy głębsze wybory
@@ -594,20 +649,20 @@ export default function MicroservicesColumns() {
   };
 
 
-  const itemStyle = (selected: boolean): React.CSSProperties => ({
-    position: "relative",            // ⬅️ potrzebne dla paska
-    display: "flex",
-    flexDirection: "column",
-    gap: 4,
-    padding: "10px 12px",
-    paddingRight: 12 + STRIPE_W,     // ⬅️ żeby treść nie nachodziła na pasek
-    borderRadius: 12,
-    border: selected ? "2px solid #ef4444" : "1px solid #e5e7eb",
-    background: "#fff",
-    cursor: "pointer",
-    boxShadow: selected ? "0 2px 8px rgba(239,68,68,0.2)" : "0 2px 8px rgba(0,0,0,0.06)",
-    marginBottom: 8,
-  });
+const itemStyle = (selected: boolean): React.CSSProperties => ({
+  position: "relative",
+  display: "flex",
+  flexDirection: "column",
+  gap: 4,
+  padding: "10px 12px",
+  paddingLeft: 12 + STRIPE_W,      // miejsce na pionowy pasek po LEWEJ
+  borderRadius: 12,
+  border: selected ? "2px solid #ef4444" : "1px solid #e5e7eb",
+  background: "#fff",
+  cursor: "pointer",
+  boxShadow: selected ? "0 2px 8px rgba(239,68,68,0.2)" : "0 2px 8px rgba(0,0,0,0.06)",
+  marginBottom: 8,
+});
 
   return (
     <div style={{ width: "100%", height: "100%", background: "#f9fafb" }}>
@@ -676,7 +731,13 @@ export default function MicroservicesColumns() {
               const selectedId = selections[colIdx] ?? null;
 
               return (
-                <div key={colIdx} style={columnStyle} className="msd-col">
+                  <div
+                    key={colIdx}
+                    ref={(el) => { colRefs.current[colIdx] = el; }}
+                    className="msd-col"
+                    style={{ ...columnStyle, position: "relative", zIndex: 100 + colIdx }}
+                  >
+
                   {colIdx === 0 ? (
                     <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>
                       Rooty
@@ -690,6 +751,88 @@ export default function MicroservicesColumns() {
                   {items.length === 0 && (
                     <div style={{ fontSize: 13, color: "#6b7280" }}>Brak elementów</div>
                   )}
+
+                  {/* OVERLAY: rysuje połączenia z kolumny colIdx do colIdx+1 */}
+                  {(() => {
+                    // rodzic to zaznaczony w tej kolumnie
+                    const parentId = selections[colIdx];
+                    const nextColItems = columns[colIdx + 1];
+                    if (!parentId || !nextColItems || nextColItems.length === 0) return null;
+
+                    // Y-środek rodzica w układzie TEJ kolumny
+                    const yParent = centerYIn(colIdx, colIdx, parentId);
+                    if (yParent == null) return null;
+
+                    // Y-środki dzieci przeliczone do układu TEJ kolumny
+                    const yChildren = nextColItems
+                      .map(nid => {
+                        const y = centerYIn(colIdx, colIdx + 1, nid);
+                        return y == null ? null : { nid, y };
+                      })
+                      .filter(Boolean) as { nid: string; y: number }[];
+
+                    if (yChildren.length === 0) return null;
+
+                    const H = colContentHeight(colIdx);
+                    const W = (colRefs.current[colIdx]?.clientWidth ?? 0);
+                    const BORDER_X = W - 1;   // ~prawe 1px borderRight kolumny
+
+                    const minChildY = Math.min(...yChildren.map(v => v.y));
+                    const maxChildY = Math.max(...yChildren.map(v => v.y));
+
+                    // pień ma obejmować i rodzica, i dzieci
+                    const trunkY1 = Math.min(minChildY, yParent);
+                    const trunkY2 = Math.max(maxChildY, yParent);
+
+                    const TAP_PARENT = 12;    // poziomy „języczek” od rodzica do pnia
+                    const TAP_CHILD  = 10;    // krótka odnoga do dziecka
+                    const STROKE     = 6;     // stała grubość
+                    const COLOR      = "rgb(14, 165, 233)"; // żółty jak w przykładzie
+
+                    return (
+                      <svg
+                        width="100%"
+                        height={H}
+                        style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
+                      >
+                        {/* języczek od rodzica */}
+                        <line
+                          x1={BORDER_X - TAP_PARENT}
+                          y1={yParent}
+                          x2={BORDER_X}
+                          y2={yParent}
+                          stroke={COLOR}
+                          strokeWidth={STROKE}
+                          strokeLinecap="round"
+                        />
+
+                        <line
+                          x1={BORDER_X}
+                          y1={trunkY1}
+                          x2={BORDER_X}
+                          y2={trunkY2}
+                          stroke={COLOR}
+                          strokeWidth={STROKE}
+                          strokeLinecap="round"
+                        />
+
+                        {/* odnogi do każdego dziecka */}
+                        {yChildren.map(({ y }, i) => (
+                          <line
+                            key={i}
+                            x1={BORDER_X}
+                            y1={y}
+                            x2={BORDER_X + TAP_CHILD}
+                            y2={y}
+                            stroke={COLOR}
+                            strokeWidth={STROKE}
+                            strokeLinecap="round"
+                          />
+                        ))}
+                      </svg>
+                    );
+                  })()}
+
 
                   {items.map((id) => {
                     const label = graph.nodeLabels[id] ?? id;
@@ -720,6 +863,7 @@ export default function MicroservicesColumns() {
                     return (
                       <div
                         key={id}
+                        ref={(el) => { itemRefs.current[`${colIdx}:${id}`] = el; }}
                         style={itemStyle(isSelected)}
                         onClick={() => {
                           onSelect(colIdx, id);
@@ -737,12 +881,12 @@ export default function MicroservicesColumns() {
                           style={{
                             position: "absolute",
                             top: 0,
-                            right: 0,
+                            left: 0,                         // po lewej
                             width: STRIPE_W,
                             height: "100%",
                             background: stripeColor,
-                            borderTopRightRadius: 10,
-                            borderBottomRightRadius: 10,
+                            borderTopLeftRadius: 10,         // zaokrąglenie po lewej
+                            borderBottomLeftRadius: 10,
                           }}
                         />
 
