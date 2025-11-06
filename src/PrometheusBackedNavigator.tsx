@@ -238,22 +238,22 @@ function buildAdjacency(g: Graph): Map<NodeId, NodeId[]> {
   return adj;
 }
 
-function worstChildErrorRate(parent: NodeId, adj: Map<NodeId, NodeId[]>, metrics: Graph["metricsByEdge"]) {
-  const children = Array.from(new Set(adj.get(parent) ?? []));
-  if (children.length === 0) return 0;
-  let maxErr = 0;
-  for (const c of children) {
-    const m = metrics[`${parent}->${c}`];
-    if (m && m.errorRate > maxErr) maxErr = m.errorRate;
-  }
-  return maxErr;
-}
+// function worstChildErrorRate(parent: NodeId, adj: Map<NodeId, NodeId[]>, metrics: Graph["metricsByEdge"]) {
+//   const children = Array.from(new Set(adj.get(parent) ?? []));
+//   if (children.length === 0) return 0;
+//   let maxErr = 0;
+//   for (const c of children) {
+//     const m = metrics[`${parent}->${c}`];
+//     if (m && m.errorRate > maxErr) maxErr = m.errorRate;
+//   }
+//   return maxErr;
+// }
 
-function errorRateToStatus(err: number): ServiceNode["status"] {
-  if (err > 0.1) return "down";
-  if (err > 0.02) return "degraded";
-  return "healthy";
-}
+// function errorRateToStatus(err: number): ServiceNode["status"] {
+//   if (err > 0.1) return "down";
+//   if (err > 0.02) return "degraded";
+//   return "healthy";
+// }
 
 function buildTree(g: Graph, env: string): ServiceNode[] {
   const adj = buildAdjacency(g);
@@ -269,7 +269,7 @@ function buildTree(g: Graph, env: string): ServiceNode[] {
 
   const roots = computeRoots(g);
 
-  // ⬇️ memo po *kontekście* (parentId->id), nie po samym id
+  // memoizacja po *kontekście* (parentId->id), bo errIncoming/rpm zależy od rodzica
   const memo = new Map<string, ServiceNode>();
   const keyOf = (id: NodeId, parentId?: NodeId) => `${parentId ?? "ROOT"}->${id}`;
 
@@ -282,22 +282,21 @@ function buildTree(g: Graph, env: string): ServiceNode[] {
     return srcs.length ? g.rawByEdge[`${srcs[0]}->${id}`] : undefined;
   };
 
+  // pomocniczo: konwersja errorRate->status
+  const rateToStatus = (err: number): ServiceNode["status"] => {
+    if (err > 0.1) return "down";
+    if (err > 0.02) return "degraded";
+    return "healthy";
+  };
+
   const buildNode = (id: NodeId, parentId?: NodeId): ServiceNode => {
     const memoKey = keyOf(id, parentId);
     if (memo.has(memoKey)) return memo.get(memoKey)!;
 
     const name = g.nodeLabels[id] ?? id;
 
-    // 1) błąd na krawędzi przychodzącej (parent -> id), jeśli istnieje
+    // błąd na krawędzi przychodzącej (parent -> id)
     const errIncoming = parentId ? (g.metricsByEdge[`${parentId}->${id}`]?.errorRate ?? 0) : 0;
-
-    // 2) najgorszy błąd dzieci (subtree)
-    const worstErr = worstChildErrorRate(id, adj, g.metricsByEdge);
-
-    // 3) KOLOR = tylko subtree (zgodnie z Twoją intencją)
-    const status: ServiceNode["status"] = errorRateToStatus(worstErr);
-
-    // rpm zależy od krawędzi parent->id (dla rootów 0)
     const rpm = parentId ? (g.metricsByEdge[`${parentId}->${id}`]?.rps ?? 0) : 0;
 
     // surowe etykiety do PromQL (bez normalizacji)
@@ -313,15 +312,9 @@ function buildTree(g: Graph, env: string): ServiceNode[] {
       targetServiceVersion:   asTgt?.tgtVer   || undefined,
     };
 
-    // możesz chcieć mieć ten wskaźnik w UI (np. badge) – wkładam do meta
-    const meta = { incomingErrorRate: errIncoming };
-
-    const node: ServiceNode = { id, name, status, rpm, children: [], promLabels, meta };
-    memo.set(memoKey, node);
-
-    // dzieci + sort
-    const kids = Array.from(new Set(adj.get(id) ?? []));
-    kids.sort((a, b) => {
+    // zbuduj dzieci najpierw (post-order), żeby mieć ich statusy
+    const kidIds = Array.from(new Set(adj.get(id) ?? []));
+    kidIds.sort((a, b) => {
       const ea = g.metricsByEdge[`${id}->${a}`]?.errorRate ?? 0;
       const eb = g.metricsByEdge[`${id}->${b}`]?.errorRate ?? 0;
       if (eb !== ea) return eb - ea;
@@ -332,13 +325,35 @@ function buildTree(g: Graph, env: string): ServiceNode[] {
       const lb = (g.nodeLabels[b] ?? b).toLowerCase();
       return la.localeCompare(lb);
     });
+    const children = kidIds.map((kid) => buildNode(kid, id));
 
-    node.children = kids.map((kid) => buildNode(kid, id));
+    // severities: dzieci → rodzic dziedziczy najgorsze dziecko
+    const order = { healthy: 0, degraded: 1, down: 2 } as const;
+
+    const childWorstStatus = children.reduce<"healthy" | "degraded" | "down">((acc, c) => {
+      const cur = (c.status ?? "healthy") as "healthy" | "degraded" | "down";
+      return order[cur] > order[acc] ? cur : acc;
+    }, "healthy");
+
+
+    const isLeaf = children.length === 0;
+
+    // KLUCZ:
+    // - Liść: status wg *errIncoming* (dziecko "świeci" gdy krawędź do niego sypie błędami)
+    // - Węzeł wewnętrzny: status wg dzieci (NIE wg własnego errIncoming)
+    const status: ServiceNode["status"] = isLeaf ? rateToStatus(errIncoming) : childWorstStatus;
+
+    // opcjonalnie: badge do UI
+    const meta: Record<string, any> = { incomingErrorRate: errIncoming };
+
+    const node: ServiceNode = { id, name, status, rpm, children, promLabels, meta: meta as any };
+    memo.set(memoKey, node);
     return node;
   };
 
   return roots.map((r) => buildNode(r));
 }
+
 
 
 
