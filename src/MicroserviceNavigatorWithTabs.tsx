@@ -150,29 +150,37 @@ export function MicroserviceNavigatorWithTabs({
           const worst = worstStatusInGroup(allRoots);
           const stripe = STATUS_COLOR[worst];
 
+          // --- PREZENTACJA: ukryj wiodące "default" w etykiecie taba ---
+          const rawLabel = t;
+          const cleaned = t === allTabLabel ? t : t.replace(/^default(?:\.|$)/i, "");
+          const label = cleaned || rawLabel;
+
           return (
             <button
               key={t}
               onClick={() => setActive(t)}
               className={[
-                "relative inline-flex items-center rounded-xl border text-sm transition-all",
-                "px-3 py-1.5 pl-5",            // miejsce na pasek po lewej
-                "bg-white",                    // brak szarego podświetlania
+                "relative inline-flex items-center rounded-xl border text-[11px] transition-all",
+                "px-2.5 py-1 pl-4",          // ciaśniejsze paddingi
+                "bg-white",                   // brak szarego podświetlania
                 isActive
                   ? "ring-2 ring-indigo-600 border-indigo-600 shadow"
                   : "border-black/10 hover:ring-1 hover:ring-neutral-300",
               ].join(" ")}
-              title={`${t} (${count})`}
+              title={`${label} (${count})`}
             >
               {/* pionowy pasek statusu jak w kafelkach */}
               <span
                 aria-hidden
                 className={`${stripe} absolute inset-y-0 left-0 w-2 rounded-l-xl`}
               />
-              <span className="font-medium whitespace-normal break-words">{t}</span>
+              <span className="font-medium leading-tight whitespace-normal break-words">
+                {label}
+              </span>
               <span
                 className={[
-                  "ml-2 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full text-xs",
+                  "ml-2 inline-flex h-3 min-w-[14px] items-center justify-center rounded-full px-[3px]",
+                  "text-[9px] leading-none",
                   isActive
                     ? "bg-indigo-50 text-indigo-700 border border-indigo-200"
                     : "bg-black/5 text-neutral-700",
