@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { MicroserviceDependencyNavigator, type ServiceNode } from "./MicroserviceDependencyNavigator";
+import { type ServiceNode } from "./MicroserviceDependencyNavigator";
+import MicroserviceNavigatorWithTabs from "./MicroserviceNavigatorWithTabs";
 
 /**
  * PrometheusBackedNavigator
@@ -134,6 +135,7 @@ function makeTargetLabel(m: any) {
   const base = (m?.targetServiceName ?? "").trim();
   return appendVersion(base, (m?.targetServiceVersion ?? "").trim());
 }
+
 
 /* ============================ POBRANIE GRAFU ============================ */
 
@@ -309,6 +311,7 @@ export default function PrometheusBackedNavigator() {
   const [error, setError] = useState<string | null>(null);
   const [graph, setGraph] = useState<Graph | null>(null);
 
+  
   const refresh = async () => {
     setLoading(true);
     setError(null);
@@ -331,6 +334,7 @@ export default function PrometheusBackedNavigator() {
   }, [env, winIdx]);
 
   const roots: ServiceNode[] = useMemo(() => (graph ? buildTree(graph) : []), [graph]);
+  
 
   return (
     <div className="w-full">
@@ -379,32 +383,35 @@ export default function PrometheusBackedNavigator() {
         </div>
       )}
 
-      <div className="p-3">
-        <MicroserviceDependencyNavigator
-          data={roots}
-          maxColumns={6}
-          onSelect={(node) => {
-            // Tu możesz rozwinąć: side-panel z detalami (statusy, paths, p95, itp.)
-            // detailsEdge = `${parent}->${child}` – jeśli będziesz trzymać stan ścieżki
-            console.debug("select:", node);
-          }}
-          // Przykładowy renderer kafelka z RPS i statusem
-          renderNode={(node, isActive) => {
-            const color = node.status === "down" ? "bg-red-500" : node.status === "degraded" ? "bg-amber-500" : "bg-emerald-500";
-            return (
-              <div className={`group relative flex rounded-2xl shadow-sm hover:shadow transition-all cursor-pointer overflow-hidden ${isActive ? "ring-2 ring-indigo-500" : "ring-1 ring-black/5"}`}>
-                <span className={`${color} absolute inset-y-0 left-0 w-2`} aria-hidden="true" />
-                <div className="flex w-full items-center gap-3 p-3 pl-5">
-                  <div className="truncate font-medium" title={node.name}>{node.name}</div>
-                  {Number.isFinite(node.rpm) && node.rpm! > 0 && (
-                    <div className="ml-auto text-xs tabular-nums text-neutral-600">{node.rpm}/s</div>
-                  )}
-                </div>
-              </div>
-            );
-          }}
-        />
-      </div>
+<div className="p-3">
+  <MicroserviceNavigatorWithTabs
+    data={roots}
+    depth={3}          // grupowanie do 3. członu, np. a.b.c.d -> a.b.c
+    maxColumns={6}
+    showAllTab         // (opcjonalnie) doda tab zbiorczy "(Wszystkie)"
+    onSelect={(node) => {
+      console.debug("select:", node);
+    }}
+    renderNode={(node, isActive) => {
+      const color =
+        node.status === "down" ? "bg-red-500" :
+        node.status === "degraded" ? "bg-amber-500" :
+        "bg-emerald-500";
+      return (
+        <div className={`group relative flex rounded-2xl shadow-sm hover:shadow transition-all cursor-pointer overflow-hidden ${isActive ? "ring-2 ring-indigo-500" : "ring-1 ring-black/5"}`}>
+          <span className={`${color} absolute inset-y-0 left-0 w-2`} aria-hidden="true" />
+          <div className="flex w-full items-center gap-3 p-3 pl-5">
+            <div className="truncate font-medium" title={node.name}>{node.name}</div>
+            {Number.isFinite(node.rpm) && node.rpm! > 0 && (
+              <div className="ml-auto text-xs tabular-nums text-neutral-600">{node.rpm}/s</div>
+            )}
+          </div>
+        </div>
+      );
+    }}
+  />
+</div>
+
     </div>
   );
 }

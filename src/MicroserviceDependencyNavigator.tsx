@@ -76,8 +76,11 @@ export function MicroserviceDependencyNavigator({
   maxColumns?: number;
   renderNode?: (node: ServiceNode, isActive: boolean) => React.ReactNode;
 }) {
+  const contentRef = useRef<HTMLDivElement | null>(null);
+
   const containerRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
 
   // Bezpieczny fallback, gdy `data` nie jest tablicą
   const safeData = Array.isArray(data) ? data : [];
@@ -94,70 +97,104 @@ export function MicroserviceDependencyNavigator({
     [safeData, path, maxColumns]
   );
 
+  useLayoutEffect(() => {
+  recomputeArrows();
+
+  const sc = scrollRef.current;
+  const content = contentRef.current;
+
+  const ro = new ResizeObserver(() => recomputeArrows());
+  if (content) ro.observe(content);
+
+  const onScroll = () => recomputeArrows();
+  sc?.addEventListener("scroll", onScroll, { passive: true });
+  window.addEventListener("resize", onScroll, { passive: true });
+
+  return () => {
+    ro.disconnect();
+    sc?.removeEventListener("scroll", onScroll);
+    window.removeEventListener("resize", onScroll);
+  };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+}, [path, columns]);
+
+
   // Rysowanie strzałek (zróżnicowana grubość od rpm)
   type EdgeSeg = { d: string; width: number };
   const [edgesByDepth, setEdgesByDepth] = useState<EdgeSeg[][]>([]);
 
-  const recomputeArrows = () => {
-    const container = containerRef.current;
-    const svg = svgRef.current;
-    if (!container || !svg) return;
+const recomputeArrows = () => {
+  const scrollEl = scrollRef.current;
+  const svg = svgRef.current;
+  if (!scrollEl || !svg) return;
 
-    const newEdges: EdgeSeg[][] = [];
-    // Dla każdego poziomu bierzemy aktywnego rodzica i jego dzieci w następnej kolumnie
-    for (let depth = 0; depth < path.length; depth++) {
-      const parent = path[depth];
-      if (!parent) continue;
-      const parentKey = `${depth}:${parent.id}`;
-      const parentEl = nodeRefs.current.get(parentKey);
-      const children = parent.children ?? [];
-      if (!parentEl || children.length === 0) {
-        newEdges.push([]);
-        continue;
-      }
+  // szer./wys. SVG = rozmiar zawartości (a nie viewportu)
+  const W = (contentRef.current?.scrollWidth ?? scrollEl.scrollWidth);
+  const H = (contentRef.current?.scrollHeight ?? scrollEl.scrollHeight);
+  svg.setAttribute("width", String(W));
+  svg.setAttribute("height", String(H));
 
-      const parentRect = parentEl.getBoundingClientRect();
-      const contRect = container.getBoundingClientRect();
+  // offsety scrolla
+  const scrollX = scrollEl.scrollLeft;
+  const scrollY = scrollEl.scrollTop;
 
-      const parentX = parentRect.right - contRect.left; // prawy środek rodzica
-      const parentY = parentRect.top - contRect.top + parentRect.height / 2;
+  // viewport, względem którego odejmujemy recty
+  const viewportRect = scrollEl.getBoundingClientRect();
 
-      // lokalne min/max rpm dzieci
-      const rpms = children.map((c) => c.rpm ?? 0);
-      const minR = rpms.length ? Math.min(...rpms) : 0;
-      const maxR = rpms.length ? Math.max(...rpms) : 0;
-      const depthEdges: EdgeSeg[] = [];
+  const newEdges: EdgeSeg[][] = [];
 
-      for (const child of children) {
-        const childKey = `${depth + 1}:${child.id}`;
-        const childEl = nodeRefs.current.get(childKey);
-        if (!childEl) continue;
-        const childRect = childEl.getBoundingClientRect();
-        const childX = childRect.left - contRect.left;
-        const childY = childRect.top - contRect.top + childRect.height / 2;
-        const midX = parentX + (childX - parentX) * 0.5;
-        const dMain = `M ${parentX} ${parentY} C ${midX} ${parentY}, ${midX} ${childY}, ${childX} ${childY}`;
-        const width = rpmToWidth(child.rpm ?? 0, minR, maxR);
-        depthEdges.push({ d: dMain, width });
+  for (let depth = 0; depth < path.length; depth++) {
+    const parent = path[depth];
+    if (!parent) { newEdges.push([]); continue; }
 
-        // grot strzałki
-        const arrowSize = 6;
-        const angle = Math.atan2(childY - parentY, childX - parentX);
-        const ax = childX;
-        const ay = childY;
-        const a1x = ax - arrowSize * Math.cos(angle - Math.PI / 8);
-        const a1y = ay - arrowSize * Math.sin(angle - Math.PI / 8);
-        const a2x = ax - arrowSize * Math.cos(angle + Math.PI / 8);
-        const a2y = ay - arrowSize * Math.sin(angle + Math.PI / 8);
-        depthEdges.push({ d: `M ${ax} ${ay} L ${a1x} ${a1y}`, width });
-        depthEdges.push({ d: `M ${ax} ${ay} L ${a2x} ${a2y}`, width });
-      }
+    const parentKey = `${depth}:${parent.id}`;
+    const parentEl = nodeRefs.current.get(parentKey);
+    const children = parent.children ?? [];
+    if (!parentEl || children.length === 0) { newEdges.push([]); continue; }
 
-      newEdges.push(depthEdges);
+    const parentRect = parentEl.getBoundingClientRect();
+
+    const parentX = (parentRect.right - viewportRect.left) + scrollX;
+    const parentY = (parentRect.top   - viewportRect.top ) + parentRect.height / 2 + scrollY;
+
+    const rpms = children.map(c => c.rpm ?? 0);
+    const minR = rpms.length ? Math.min(...rpms) : 0;
+    const maxR = rpms.length ? Math.max(...rpms) : 0;
+    const depthEdges: EdgeSeg[] = [];
+
+    for (const child of children) {
+      const childKey = `${depth + 1}:${child.id}`;
+      const childEl = nodeRefs.current.get(childKey);
+      if (!childEl) continue;
+
+      const childRect = childEl.getBoundingClientRect();
+      const childX = (childRect.left - viewportRect.left) + scrollX;
+      const childY = (childRect.top  - viewportRect.top ) + childRect.height / 2 + scrollY;
+
+      const midX = parentX + (childX - parentX) * 0.5;
+      const dMain = `M ${parentX} ${parentY} C ${midX} ${parentY}, ${midX} ${childY}, ${childX} ${childY}`;
+      const width = rpmToWidth(child.rpm ?? 0, minR, maxR);
+
+      depthEdges.push({ d: dMain, width });
+
+      const arrowSize = 6;
+      const angle = Math.atan2(childY - parentY, childX - parentX);
+      const ax = childX, ay = childY;
+      const a1x = ax - arrowSize * Math.cos(angle - Math.PI / 8);
+      const a1y = ay - arrowSize * Math.sin(angle - Math.PI / 8);
+      const a2x = ax - arrowSize * Math.cos(angle + Math.PI / 8);
+      const a2y = ay - arrowSize * Math.sin(angle + Math.PI / 8);
+
+      depthEdges.push({ d: `M ${ax} ${ay} L ${a1x} ${a1y}`, width });
+      depthEdges.push({ d: `M ${ax} ${ay} L ${a2x} ${a2y}`, width });
     }
 
-    setEdgesByDepth(newEdges);
-  };
+    newEdges.push(depthEdges);
+  }
+
+  setEdgesByDepth(newEdges);
+};
+
 
   // Obserwuj resize i scroll, by odświeżać strzałki
   useLayoutEffect(() => {
@@ -217,11 +254,11 @@ export function MicroserviceDependencyNavigator({
   };
 
   return (
-    <div className="w-full h-[520px] relative" ref={containerRef}>
+    <div className="w-full h-[520px] relative">
       {/* Tło i przewijanie w poziomie */}
-      <div className="absolute inset-0 overflow-x-auto overflow-y-hidden">
+      <div ref={scrollRef} className="absolute inset-0 overflow-x-auto overflow-y-hidden">
         {/* SVG na strzałki */}
-        <svg ref={svgRef} className="absolute inset-0 w-full h-full pointer-events-none">
+        <svg ref={svgRef} className="absolute inset-0 pointer-events-none">
           {edgesByDepth.map((edges, i) =>
             edges.map((e, j) => (
               <path
@@ -237,7 +274,7 @@ export function MicroserviceDependencyNavigator({
         </svg>
 
         {/* Kolumny (bez widocznych ramek) */}
-        <div className="relative flex gap-6 px-4 py-4 min-w-full">
+        <div ref={contentRef} className="relative flex gap-6 px-4 py-4 min-w-full">
           {columns.map((col, depth) => {
             const items = Array.isArray(col) ? col : [];
             return (
