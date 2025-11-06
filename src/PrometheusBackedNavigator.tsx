@@ -402,9 +402,6 @@ export default function PrometheusBackedNavigator() {
           <span className={`${color} absolute inset-y-0 left-0 w-2`} aria-hidden="true" />
           <div className="flex w-full items-center gap-3 p-3 pl-5">
             <div className="truncate font-medium" title={node.name}>{node.name}</div>
-            {Number.isFinite(node.rpm) && node.rpm! > 0 && (
-              <div className="ml-auto text-xs tabular-nums text-neutral-600">{node.rpm}/s</div>
-            )}
           </div>
         </div>
       );

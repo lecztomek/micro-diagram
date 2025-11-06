@@ -1,6 +1,7 @@
 import React, { useLayoutEffect, useMemo, useRef, useState } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChevronRight } from "lucide-react";
+import ConnectionDetailsModal, { type ConnectionDetails } from "./ConnectionDetailsModal";
+import { ChevronRight, Info } from "lucide-react";
 
 /**
  * MicroserviceDependencyNavigator
@@ -77,7 +78,6 @@ export function MicroserviceDependencyNavigator({
   renderNode?: (node: ServiceNode, isActive: boolean) => React.ReactNode;
 }) {
   const contentRef = useRef<HTMLDivElement | null>(null);
-
   const containerRef = useRef<HTMLDivElement | null>(null);
   const svgRef = useRef<SVGSVGElement | null>(null);
   const scrollRef = useRef<HTMLDivElement | null>(null);
@@ -97,104 +97,115 @@ export function MicroserviceDependencyNavigator({
     [safeData, path, maxColumns]
   );
 
+  // --- MODAL: edge selection state ---
+  type SelectedEdge =
+    | { parent: ServiceNode; child: ServiceNode; depth: number; connection?: ConnectionDetails }
+    | null;
+  const [selectedEdge, setSelectedEdge] = useState<SelectedEdge>(null);
+
   useLayoutEffect(() => {
-  recomputeArrows();
+    recomputeArrows();
 
-  const sc = scrollRef.current;
-  const content = contentRef.current;
+    const sc = scrollRef.current;
+    const content = contentRef.current;
 
-  const ro = new ResizeObserver(() => recomputeArrows());
-  if (content) ro.observe(content);
+    const ro = new ResizeObserver(() => recomputeArrows());
+    if (content) ro.observe(content);
 
-  const onScroll = () => recomputeArrows();
-  sc?.addEventListener("scroll", onScroll, { passive: true });
-  window.addEventListener("resize", onScroll, { passive: true });
+    const onScroll = () => recomputeArrows();
+    sc?.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("resize", onScroll, { passive: true });
 
-  return () => {
-    ro.disconnect();
-    sc?.removeEventListener("scroll", onScroll);
-    window.removeEventListener("resize", onScroll);
-  };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-}, [path, columns]);
-
+    return () => {
+      ro.disconnect();
+      sc?.removeEventListener("scroll", onScroll);
+      window.removeEventListener("resize", onScroll);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path, columns]);
 
   // Rysowanie strzałek (zróżnicowana grubość od rpm)
   type EdgeSeg = { d: string; width: number };
   const [edgesByDepth, setEdgesByDepth] = useState<EdgeSeg[][]>([]);
 
-const recomputeArrows = () => {
-  const scrollEl = scrollRef.current;
-  const svg = svgRef.current;
-  if (!scrollEl || !svg) return;
+  const recomputeArrows = () => {
+    const scrollEl = scrollRef.current;
+    const svg = svgRef.current;
+    if (!scrollEl || !svg) return;
 
-  // szer./wys. SVG = rozmiar zawartości (a nie viewportu)
-  const W = (contentRef.current?.scrollWidth ?? scrollEl.scrollWidth);
-  const H = (contentRef.current?.scrollHeight ?? scrollEl.scrollHeight);
-  svg.setAttribute("width", String(W));
-  svg.setAttribute("height", String(H));
+    // szer./wys. SVG = rozmiar zawartości (a nie viewportu)
+    const W = contentRef.current?.scrollWidth ?? scrollEl.scrollWidth;
+    const H = contentRef.current?.scrollHeight ?? scrollEl.scrollHeight;
+    svg.setAttribute("width", String(W));
+    svg.setAttribute("height", String(H));
 
-  // offsety scrolla
-  const scrollX = scrollEl.scrollLeft;
-  const scrollY = scrollEl.scrollTop;
+    // offsety scrolla
+    const scrollX = scrollEl.scrollLeft;
+    const scrollY = scrollEl.scrollTop;
 
-  // viewport, względem którego odejmujemy recty
-  const viewportRect = scrollEl.getBoundingClientRect();
+    // viewport, względem którego odejmujemy recty
+    const viewportRect = scrollEl.getBoundingClientRect();
 
-  const newEdges: EdgeSeg[][] = [];
+    const newEdges: EdgeSeg[][] = [];
 
-  for (let depth = 0; depth < path.length; depth++) {
-    const parent = path[depth];
-    if (!parent) { newEdges.push([]); continue; }
+    for (let depth = 0; depth < path.length; depth++) {
+      const parent = path[depth];
+      if (!parent) {
+        newEdges.push([]);
+        continue;
+      }
 
-    const parentKey = `${depth}:${parent.id}`;
-    const parentEl = nodeRefs.current.get(parentKey);
-    const children = parent.children ?? [];
-    if (!parentEl || children.length === 0) { newEdges.push([]); continue; }
+      const parentKey = `${depth}:${parent.id}`;
+      const parentEl = nodeRefs.current.get(parentKey);
+      const children = parent.children ?? [];
+      if (!parentEl || children.length === 0) {
+        newEdges.push([]);
+        continue;
+      }
 
-    const parentRect = parentEl.getBoundingClientRect();
+      const parentRect = parentEl.getBoundingClientRect();
 
-    const parentX = (parentRect.right - viewportRect.left) + scrollX;
-    const parentY = (parentRect.top   - viewportRect.top ) + parentRect.height / 2 + scrollY;
+      const parentX = parentRect.right - viewportRect.left + scrollX;
+      const parentY = parentRect.top - viewportRect.top + parentRect.height / 2 + scrollY;
 
-    const rpms = children.map(c => c.rpm ?? 0);
-    const minR = rpms.length ? Math.min(...rpms) : 0;
-    const maxR = rpms.length ? Math.max(...rpms) : 0;
-    const depthEdges: EdgeSeg[] = [];
+      const rpms = children.map((c) => c.rpm ?? 0);
+      const minR = rpms.length ? Math.min(...rpms) : 0;
+      const maxR = rpms.length ? Math.max(...rpms) : 0;
+      const depthEdges: EdgeSeg[] = [];
 
-    for (const child of children) {
-      const childKey = `${depth + 1}:${child.id}`;
-      const childEl = nodeRefs.current.get(childKey);
-      if (!childEl) continue;
+      for (const child of children) {
+        const childKey = `${depth + 1}:${child.id}`;
+        const childEl = nodeRefs.current.get(childKey);
+        if (!childEl) continue;
 
-      const childRect = childEl.getBoundingClientRect();
-      const childX = (childRect.left - viewportRect.left) + scrollX;
-      const childY = (childRect.top  - viewportRect.top ) + childRect.height / 2 + scrollY;
+        const childRect = childEl.getBoundingClientRect();
+        const childX = childRect.left - viewportRect.left + scrollX;
+        const childY = childRect.top - viewportRect.top + childRect.height / 2 + scrollY;
 
-      const midX = parentX + (childX - parentX) * 0.5;
-      const dMain = `M ${parentX} ${parentY} C ${midX} ${parentY}, ${midX} ${childY}, ${childX} ${childY}`;
-      const width = rpmToWidth(child.rpm ?? 0, minR, maxR);
+        const midX = parentX + (childX - parentX) * 0.5;
+        const dMain = `M ${parentX} ${parentY} C ${midX} ${parentY}, ${midX} ${childY}, ${childX} ${childY}`;
+        const width = rpmToWidth(child.rpm ?? 0, minR, maxR);
 
-      depthEdges.push({ d: dMain, width });
+        depthEdges.push({ d: dMain, width });
 
-      const arrowSize = 6;
-      const angle = Math.atan2(childY - parentY, childX - parentX);
-      const ax = childX, ay = childY;
-      const a1x = ax - arrowSize * Math.cos(angle - Math.PI / 8);
-      const a1y = ay - arrowSize * Math.sin(angle - Math.PI / 8);
-      const a2x = ax - arrowSize * Math.cos(angle + Math.PI / 8);
-      const a2y = ay - arrowSize * Math.sin(angle + Math.PI / 8);
+        const arrowSize = 6;
+        const angle = Math.atan2(childY - parentY, childX - parentX);
+        const ax = childX,
+          ay = childY;
+        const a1x = ax - arrowSize * Math.cos(angle - Math.PI / 8);
+        const a1y = ay - arrowSize * Math.sin(angle - Math.PI / 8);
+        const a2x = ax - arrowSize * Math.cos(angle + Math.PI / 8);
+        const a2y = ay - arrowSize * Math.sin(angle + Math.PI / 8);
 
-      depthEdges.push({ d: `M ${ax} ${ay} L ${a1x} ${a1y}`, width });
-      depthEdges.push({ d: `M ${ax} ${ay} L ${a2x} ${a2y}`, width });
+        depthEdges.push({ d: `M ${ax} ${ay} L ${a1x} ${a1y}`, width });
+        depthEdges.push({ d: `M ${ax} ${ay} L ${a2x} ${a2y}`, width });
+      }
+
+      newEdges.push(depthEdges);
     }
 
-    newEdges.push(depthEdges);
-  }
-
-  setEdgesByDepth(newEdges);
-};
-
+    setEdgesByDepth(newEdges);
+  };
 
   // Obserwuj resize i scroll, by odświeżać strzałki
   useLayoutEffect(() => {
@@ -223,31 +234,62 @@ const recomputeArrows = () => {
     });
   };
 
-  const renderTile = (node: ServiceNode, isActive: boolean) => {
-    if (renderNode) return renderNode(node, isActive);
-    const barColor =
-      node.status === "down"
-        ? "bg-red-500"
-        : node.status === "degraded"
-        ? "bg-amber-500"
-        : "bg-emerald-500";
+  // Otwieranie modala "połączenia" (parent -> child) dla węzła w kolumnie depth >= 1
+  const openDetails = (node: ServiceNode, depth: number) => {
+    if (depth < 1) return;
+    const parent = path[depth - 1];
+    if (!parent) return;
+    setSelectedEdge({ parent, child: node, depth });
+  };
 
-    // Kontener bez paddingu, overflow-hidden, aby pasek mógł iść od samej góry do dołu
+  // Renderer kafelka (obsługuje zarówno customowy renderNode, jak i domyślny z ikonką Info)
+  const renderTile = (node: ServiceNode, isActive: boolean, depth: number) => {
+    if (renderNode) {
+      // Użytkownik dostarcza własny renderer – wtedy nie dorzucamy ikonki Info,
+      // bo nie mamy gwarancji miejsca; jeśli chcesz, przenieś ikonę do swojego renderNode.
+      return renderNode(node, isActive);
+    }
+
+    const barColor =
+      node.status === "down" ? "bg-red-500" : node.status === "degraded" ? "bg-amber-500" : "bg-emerald-500";
+
     return (
       <div
         className={`group relative flex rounded-2xl shadow-sm hover:shadow transition-all cursor-pointer overflow-hidden ${
           isActive ? "ring-2 ring-indigo-500" : "ring-1 ring-black/5"
         }`}
       >
-        {/* pionowy pasek statusu od góry do dołu */}
+        {/* pionowy pasek statusu */}
         <span className={`${barColor} absolute inset-y-0 left-0 w-2`} aria-hidden="true" />
 
-        {/* zawartość z paddingiem i odsunięciem od paska */}
+        {/* zawartość */}
         <div className="flex items-center gap-3 p-3 pl-5 w-full">
-          <div className="font-medium truncate" title={node.name}>{node.name}</div>
-          {node.children && node.children.length > 0 && (
-            <ChevronRight className="ml-auto h-4 w-4 opacity-60 group-hover:translate-x-0.5 transition-transform" />
-          )}
+          <div className="font-medium truncate" title={node.name}>
+            {node.name}
+          </div>
+
+          {/* AKCJE PO PRAWEJ */}
+          <div className="ml-auto flex items-center gap-2">
+            {/* Ikona 'info' tylko od 2. kolumny */}
+            {depth >= 1 && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  openDetails(node, depth);
+                }}
+                className="rounded-lg p-1.5 hover:bg-black/5"
+                aria-label="Szczegóły połączenia"
+                title="Szczegóły połączenia"
+              >
+                <Info className="h-4 w-4 opacity-70 group-hover:opacity-100" />
+              </button>
+            )}
+
+            {node.children && node.children.length > 0 && (
+              <ChevronRight className="h-4 w-4 opacity-60 group-hover:translate-x-0.5 transition-transform" />
+            )}
+          </div>
         </div>
       </div>
     );
@@ -298,16 +340,44 @@ const recomputeArrows = () => {
                             key={node.id}
                             ref={(el) => {
                               const key = `${depth}:${node.id}`;
-                              if (el) {
-                                nodeRefs.current.set(key, el);
-                              } else {
-                                nodeRefs.current.delete(key);
-                              }
+                              if (el) nodeRefs.current.set(key, el);
+                              else nodeRefs.current.delete(key);
                             }}
                             onClick={() => handleClick(node, depth)}
+                            className="relative group"
                           >
-                            {renderTile(node, isActive)}
+                            {/* Twoja zawartość kafelka (renderNode albo fallback) */}
+                            {renderNode ? renderNode(node, isActive) : renderTile(node, isActive, depth)}
+
+                            {/* >>> DODAJ TEN BLOK – ZAWSZE widoczny action bar po prawej <<< */}
+                            {depth >= 1 && (
+                              <div
+                                className="absolute right-2 top-1/2 -translate-y-1/2 z-10 flex items-center gap-1"
+                                // upewnia się, że SVG pod spodem nie „łapie” eventów
+                                style={{ pointerEvents: "auto" }}
+                              >
+                                <button
+                                  type="button"
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    openDetails(node, depth);
+                                  }}
+                                  className="rounded-lg p-1.5 hover:bg-black/5"
+                                  aria-label="Szczegóły połączenia"
+                                  title="Szczegóły połączenia"
+                                >
+                                  <Info className="h-4 w-4 opacity-80 group-hover:opacity-100" />
+                                </button>
+
+                                {Number.isFinite(node.rpm as number) && (
+                                  <span className="px-2 py-0.5 text-xs rounded-full bg-black/5 text-neutral-700">
+                                    {Math.round(Number(node.rpm))} rpm
+                                  </span>
+                                )}
+                              </div>
+                            )}
                           </div>
+
                         );
                       })}
                     </motion.div>
@@ -322,6 +392,20 @@ const recomputeArrows = () => {
       {/* Gradienty krańcowe dla czytelności */}
       <div className="pointer-events-none absolute left-0 top-0 h-full w-6 bg-gradient-to-r from-white to-transparent" />
       <div className="pointer-events-none absolute right-0 top-0 h-full w-6 bg-gradient-to-l from-white to-transparent" />
+
+      {/* MODAL */}
+      <ConnectionDetailsModal
+        open={!!selectedEdge}
+        onClose={() => setSelectedEdge(null)}
+        parent={selectedEdge?.parent ?? null}
+        child={selectedEdge?.child ?? null}
+        connection={selectedEdge?.connection}
+        renderExtra={({ parent, child }) => (
+          <div className="text-sm text-neutral-600">
+            Trace: <span className="font-mono">{parent?.id} → {child?.id}</span>
+          </div>
+        )}
+      />
     </div>
   );
 }
@@ -404,11 +488,7 @@ export function runTests(): TestResult[] {
   try {
     const path = [roots[0], roots[0].children![1]]; // root1, child2
     const cols = computeColumns(roots, path as ServiceNode[], 6);
-    const ok =
-      cols.length >= 3 &&
-      cols[0].length === 2 && // roots
-      cols[1].length === 2 && // children of root1
-      cols[2].length === 1; // children of child2
+    const ok = cols.length >= 3 && cols[0].length === 2 && cols[1].length === 2 && cols[2].length === 1;
     results.push({ name: "Path root1 -> child2 builds 3 columns", passed: ok });
   } catch (e) {
     results.push({ name: "Path root1 -> child2 builds 3 columns", passed: false, details: String(e) });
