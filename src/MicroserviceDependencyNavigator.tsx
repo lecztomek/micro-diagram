@@ -18,14 +18,23 @@ import { ChevronRight, Info } from "lucide-react";
  *  - renderNode?: (node: ServiceNode, isActive: boolean) => React.ReactNode – własny renderer kafelka
  */
 
+const PROM_URL = "http://192.168.106.118:9090/api/v1/query"; // ⬅️ PODMIEŃ
+const PROM_HEADERS: HeadersInit = {
+  // Authorization: `Bearer ${TOKEN}`,
+};
+
+// ⬇️ DODAJ pole promLabels
 export type ServiceNode = {
   id: string;
   name: string;
   status?: "healthy" | "degraded" | "down";
-  /** opcjonalny ruch (requests per minute) używany do grubości krawędzi */
   rpm?: number;
   children?: ServiceNode[];
+  promLabels?: Record<string, string | undefined>;
+  meta?: Record<string, string | number | boolean | null | undefined>;
+
 };
+
 
 export type TestResult = { name: string; passed: boolean; details?: string };
 
@@ -399,13 +408,40 @@ export function MicroserviceDependencyNavigator({
         onClose={() => setSelectedEdge(null)}
         parent={selectedEdge?.parent ?? null}
         child={selectedEdge?.child ?? null}
-        connection={selectedEdge?.connection}
+
+        prom={{
+          url: PROM_URL,
+          headers: PROM_HEADERS,
+          systemEnv: (
+            selectedEdge?.child?.promLabels?.systemName ??
+            selectedEdge?.parent?.promLabels?.systemName
+          )
+        }}
+
+        edgeLabelsExact={{
+          systemName:
+            selectedEdge?.child?.promLabels?.systemName ??
+            selectedEdge?.parent?.promLabels?.systemName,
+
+          // ŹRÓDŁO = rodzic (executables)
+          executableGroupName: selectedEdge?.parent?.promLabels?.executableGroupName,
+          executableName:      selectedEdge?.parent?.promLabels?.executableName,
+          executableVersion:   selectedEdge?.parent?.promLabels?.executableVersion,
+
+          // CEL = dziecko (targetService*)
+          targetServiceGroupName: selectedEdge?.child?.promLabels?.targetServiceGroupName,
+          targetServiceName:      selectedEdge?.child?.promLabels?.targetServiceName,
+          targetServiceVersion:   selectedEdge?.child?.promLabels?.targetServiceVersion,
+        }}
+
         renderExtra={({ parent, child }) => (
           <div className="text-sm text-neutral-600">
             Trace: <span className="font-mono">{parent?.id} → {child?.id}</span>
           </div>
         )}
       />
+
+
     </div>
   );
 }

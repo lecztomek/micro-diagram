@@ -255,34 +255,72 @@ function errorRateToStatus(err: number): ServiceNode["status"] {
   return "healthy";
 }
 
-function buildTree(g: Graph): ServiceNode[] {
+function buildTree(g: Graph, env: string): ServiceNode[] {
   const adj = buildAdjacency(g);
+
+  // reverse adjacency: target -> [sources]
+  const revAdj = new Map<NodeId, NodeId[]>();
+  for (const eid of g.edgesSeen) {
+    const [s, t] = eid.split("->");
+    if (!revAdj.has(t)) revAdj.set(t, []);
+    revAdj.get(t)!.push(s);
+  }
+  for (const [k, v] of revAdj) revAdj.set(k, Array.from(new Set(v)));
+
   const roots = computeRoots(g);
 
-  const memo = new Map<NodeId, ServiceNode>();
+  // ⬇️ memo po *kontekście* (parentId->id), nie po samym id
+  const memo = new Map<string, ServiceNode>();
+  const keyOf = (id: NodeId, parentId?: NodeId) => `${parentId ?? "ROOT"}->${id}`;
+
+  const firstOutgoingRaw = (id: NodeId): EdgeRaw | undefined => {
+    const kids = adj.get(id) ?? [];
+    return kids.length ? g.rawByEdge[`${id}->${kids[0]}`] : undefined;
+  };
+  const firstIncomingRaw = (id: NodeId): EdgeRaw | undefined => {
+    const srcs = revAdj.get(id) ?? [];
+    return srcs.length ? g.rawByEdge[`${srcs[0]}->${id}`] : undefined;
+  };
 
   const buildNode = (id: NodeId, parentId?: NodeId): ServiceNode => {
-    if (memo.has(id)) return memo.get(id)!;
+    const memoKey = keyOf(id, parentId);
+    if (memo.has(memoKey)) return memo.get(memoKey)!;
 
-    // nazwa węzła
     const name = g.nodeLabels[id] ?? id;
 
-    // status z najgorszego dziecka (dla rootów i "targetów bez dzieci" będzie healthy)
+    // 1) błąd na krawędzi przychodzącej (parent -> id), jeśli istnieje
+    const errIncoming = parentId ? (g.metricsByEdge[`${parentId}->${id}`]?.errorRate ?? 0) : 0;
+
+    // 2) najgorszy błąd dzieci (subtree)
     const worstErr = worstChildErrorRate(id, adj, g.metricsByEdge);
-    let status: ServiceNode["status"] = errorRateToStatus(worstErr);
 
-    // rpm – jeśli ma rodzica, bierzemy metrykę krawędzi parent->id; dla rootów zostaw 0
-    let rpm = 0;
-    if (parentId) {
-      rpm = g.metricsByEdge[`${parentId}->${id}`]?.rps ?? 0;
-    }
+    // 3) KOLOR = tylko subtree (zgodnie z Twoją intencją)
+    const status: ServiceNode["status"] = errorRateToStatus(worstErr);
 
-    const node: ServiceNode = { id, name, status, rpm, children: [] };
-    memo.set(id, node);
+    // rpm zależy od krawędzi parent->id (dla rootów 0)
+    const rpm = parentId ? (g.metricsByEdge[`${parentId}->${id}`]?.rps ?? 0) : 0;
 
+    // surowe etykiety do PromQL (bez normalizacji)
+    const asSrc = firstOutgoingRaw(id);
+    const asTgt = firstIncomingRaw(id);
+    const promLabels: Record<string, string | undefined> = {
+      systemName: env,
+      executableGroupName: asSrc?.execGroup || undefined,
+      executableName:      asSrc?.execName  || undefined,
+      executableVersion:   asSrc?.execVer   || undefined,
+      targetServiceGroupName: asTgt?.tgtGroup || undefined,
+      targetServiceName:      asTgt?.tgtName  || undefined,
+      targetServiceVersion:   asTgt?.tgtVer   || undefined,
+    };
+
+    // możesz chcieć mieć ten wskaźnik w UI (np. badge) – wkładam do meta
+    const meta = { incomingErrorRate: errIncoming };
+
+    const node: ServiceNode = { id, name, status, rpm, children: [], promLabels, meta };
+    memo.set(memoKey, node);
+
+    // dzieci + sort
     const kids = Array.from(new Set(adj.get(id) ?? []));
-
-    // sort: problematyczne (errorRate desc), potem rpm desc, potem alfa
     kids.sort((a, b) => {
       const ea = g.metricsByEdge[`${id}->${a}`]?.errorRate ?? 0;
       const eb = g.metricsByEdge[`${id}->${b}`]?.errorRate ?? 0;
@@ -301,6 +339,8 @@ function buildTree(g: Graph): ServiceNode[] {
 
   return roots.map((r) => buildNode(r));
 }
+
+
 
 /* ================================ UI ADAPTER ================================ */
 
@@ -333,7 +373,10 @@ export default function PrometheusBackedNavigator() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [env, winIdx]);
 
-  const roots: ServiceNode[] = useMemo(() => (graph ? buildTree(graph) : []), [graph]);
+  const roots: ServiceNode[] = useMemo(
+  () => (graph ? buildTree(graph, env) : []),
+  [graph, env]
+);
   
 
   return (
