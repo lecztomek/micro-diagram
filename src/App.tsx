@@ -1,2 +1,5 @@
-import MicroservicesDiagram from "./MicroservicesDiagram";
-export default function App() { return <MicroservicesDiagram />; }
+import PrometheusBackedNavigator from "./PrometheusBackedNavigator";
+
+export default function Page() {
+  return <PrometheusBackedNavigator />;
+}

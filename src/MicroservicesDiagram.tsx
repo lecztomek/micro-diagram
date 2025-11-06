@@ -481,6 +481,127 @@ function StatusBars({ rows }: { rows: EdgeDetails[] | undefined }) {
   );
 }
 
+function getRelRects(grid: HTMLElement) {
+  const gr = grid.getBoundingClientRect();
+  const rel = (r: DOMRect) => ({ x: r.left - gr.left, y: r.top - gr.top, w: r.width, h: r.height, cx: r.left - gr.left + r.width / 2, cy: r.top - gr.top + r.height / 2, right: r.right - gr.left, bottom: r.bottom - gr.top });
+  return { gr, rel };
+}
+
+type GlobalConnectorsProps = {
+  gridEl: HTMLDivElement | null;
+  columns: string[][];
+  selections: string[];
+  itemRefs: React.MutableRefObject<Record<string, HTMLDivElement | null>>;
+  colRefs: React.MutableRefObject<Record<number, HTMLDivElement | null>>;
+  metricsByEdge: Graph["metricsByEdge"];             // ⬅️ NOWE
+};
+
+
+function GlobalConnectors({ gridEl, columns, selections, itemRefs, colRefs, metricsByEdge }: GlobalConnectorsProps) {
+  if (!gridEl) return null;
+  const { rel } = getRelRects(gridEl);
+
+  // stałe
+  const COLOR = "rgb(14, 165, 233)";
+  const TRUNK_STROKE = 6;                 // stała grubość pnia
+  const TAP_MIN = 3;                      // minimalna grubość tapa
+  const TAP_MAX = 14;                     // maksymalna grubość tapa
+
+  // zbierz segmenty do narysowania
+  const segs: Array<{ x1:number; y1:number; x2:number; y2:number; w:number; key:string }> = [];
+
+  for (let colIdx = 0; colIdx < columns.length; colIdx++) {
+    const parentId = selections[colIdx];
+    const nextColItems = columns[colIdx + 1];
+    if (!parentId || !nextColItems || nextColItems.length === 0) continue;
+
+    const scrollerCur  = colRefs.current[colIdx];
+    const scrollerNext = colRefs.current[colIdx + 1];
+    if (!scrollerCur || !scrollerNext) continue;
+
+    const rCur  = rel(scrollerCur.getBoundingClientRect());
+    const rNext = rel(scrollerNext.getBoundingClientRect());
+
+    const PARENT_EDGE_X = rCur.right - COLUMN_PAD;
+    const CHILD_EDGE_X  = rNext.x + COLUMN_PAD;
+
+    // pień w „szczelinie”
+    const TRUNK_X   = PARENT_EDGE_X + TRUNK_STROKE / 2;
+    const TAP_START = PARENT_EDGE_X - TRUNK_STROKE / 2;
+    const TAP_STOP  = CHILD_EDGE_X  - TRUNK_STROKE / 2;
+
+    // Y rodzica (środek kafla)
+    const parentEl = itemRefs.current[`${colIdx}:${parentId}`];
+    if (!parentEl) continue;
+    const pr = rel(parentEl.getBoundingClientRect());
+    const yParent = pr.cy;
+
+    // Y dzieci
+    const children: Array<{ id: string; y: number }> = [];
+    for (const nid of nextColItems) {
+      const childEl = itemRefs.current[`${colIdx + 1}:${nid}`];
+      if (!childEl) continue;
+      const cr = rel(childEl.getBoundingClientRect());
+      children.push({ id: nid, y: cr.cy });
+    }
+    if (!children.length) continue;
+
+    const minY = Math.min(yParent, ...children.map(v => v.y));
+    const maxY = Math.max(yParent, ...children.map(v => v.y));
+
+    // krótki „tap” od krawędzi kolumny rodzica do pnia + pionowy pień
+    segs.push({ x1: TAP_START, y1: yParent, x2: TRUNK_X, y2: yParent, w: TRUNK_STROKE, key: `tapP-${colIdx}` });
+    segs.push({ x1: TRUNK_X, y1: minY, x2: TRUNK_X, y2: maxY, w: TRUNK_STROKE, key: `trunk-${colIdx}` });
+
+    // relMax po RPS wśród rodzeństwa
+    const siblings = Array.from(new Set(nextColItems));
+    const relMax = siblings.reduce((acc, s) => {
+      const m = metricsByEdge[`${parentId}->${s}`];
+      return Math.max(acc, m?.rps ?? 0);
+    }, 0);
+
+    // tapy do dzieci — grubość wg RPS
+    children.forEach((v, i) => {
+      const edgeId = `${parentId}->${v.id}`;
+      const rps = metricsByEdge[edgeId]?.rps ?? 0;
+      const thickness = (relMax > 0)
+        ? Math.max(TAP_MIN, Math.round(TAP_MIN + (rps / relMax) * (TAP_MAX - TAP_MIN)))
+        : TAP_MIN;
+
+      const x2 = Math.min(TRUNK_X + (GRID_GAP + COLUMN_PAD + COLUMN_PAD), TAP_STOP);
+      segs.push({ x1: TRUNK_X, y1: v.y, x2, y2: v.y, w: thickness, key: `tapC-${colIdx}-${i}` });
+    });
+  }
+
+  const H = gridEl.clientHeight;
+  const W = gridEl.clientWidth;
+
+  return (
+    <svg
+      width={W}
+      height={H}
+      style={{
+        position: "absolute",
+        inset: 0,
+        pointerEvents: "none",
+        overflow: "visible",
+        zIndex: 0,                // ⬅️ pod kartami; kolumny powinny mieć zIndex ≥ 1
+      }}
+    >
+      {segs.map(s => (
+        <line
+          key={s.key}
+          x1={s.x1} y1={s.y1}
+          x2={s.x2} y2={s.y2}
+          stroke={COLOR}
+          strokeWidth={s.w}
+          strokeLinecap="round"
+        />
+      ))}
+    </svg>
+  );
+}
+
 
 /* =========================================================================================
  *  KOMPONENT
@@ -503,6 +624,10 @@ export default function MicroservicesColumns() {
     // refy do kolumn (scroll containerów) i kafelków (pozycjonowanie)
   const colRefs = useRef<Record<number, HTMLDivElement | null>>({});
   const itemRefs = useRef<Record<string, HTMLDivElement | null>>({}); // klucz: `${colIdx}:${nodeId}`
+
+  const gridRef = useRef<HTMLDivElement | null>(null);                // kontener całej siatki kolumn
+  const colWrapRefs = useRef<Record<number, HTMLDivElement | null>>({}); // wrapper każdej kolumny (nie-scrollujący)
+
 
   // mały "tick", żeby wymusić repaint na scroll/resize
   const [, forceTick] = useState(0);
@@ -562,21 +687,21 @@ export default function MicroservicesColumns() {
   }, [env, winIdx]);
 
 
-    // środek Y elementu z kolumny itemColIdx, przeliczony do układu współrzędnych kolumny overlayColIdx
-  function centerYIn(overlayColIdx: number, itemColIdx: number, nodeId: string) {
-    const overlayCol = colRefs.current[overlayColIdx];
-    const itemEl = itemRefs.current[`${itemColIdx}:${nodeId}`];
-    if (!overlayCol || !itemEl) return null;
-    const cr = overlayCol.getBoundingClientRect();
-    const ir = itemEl.getBoundingClientRect();
-    return (ir.top - cr.top) + overlayCol.scrollTop + ir.height / 2;
-  }
+  //   // środek Y elementu z kolumny itemColIdx, przeliczony do układu współrzędnych kolumny overlayColIdx
+  // function centerYIn(overlayColIdx: number, itemColIdx: number, nodeId: string) {
+  //   const overlayCol = colRefs.current[overlayColIdx];
+  //   const itemEl = itemRefs.current[`${itemColIdx}:${nodeId}`];
+  //   if (!overlayCol || !itemEl) return null;
+  //   const cr = overlayCol.getBoundingClientRect();
+  //   const ir = itemEl.getBoundingClientRect();
+  //   return (ir.top - cr.top) + overlayCol.scrollTop + ir.height / 2;
+  // }
 
-  // pełna wysokość contentu kolumny (dla <svg>)
-  function colContentHeight(colIdx: number) {
-    const col = colRefs.current[colIdx];
-    return col ? col.scrollHeight : 0;
-  }
+  // // pełna wysokość contentu kolumny (dla <svg>)
+  // function colContentHeight(colIdx: number) {
+  //   const col = colRefs.current[colIdx];
+  //   return col ? col.scrollHeight : 0;
+  // }
 
 
   // oblicz listę kolumn: [roots] + deps(selections[0]) + deps(selections[1]) + ...
@@ -643,9 +768,11 @@ export default function MicroservicesColumns() {
     overflowY: "auto",
     overflowX: "visible",     // ← DODANE: nie przycinaj w poziomie
     position: "relative",     // ← DODANE: dla zIndex potomków
-    borderRight: "1px solid #e5e7eb",
+    borderRight: "none",
     padding: COLUMN_PAD,
-    zIndex: 100 
+    zIndex: 100,
+    direction: "rtl", 
+    scrollbarGutter: "stable both-edges",
   };
 
 
@@ -657,7 +784,7 @@ const itemStyle = (selected: boolean): React.CSSProperties => ({
   padding: "10px 12px",
   paddingLeft: 12 + STRIPE_W,      // miejsce na pionowy pasek po LEWEJ
   borderRadius: 12,
-  border: selected ? "2px solid #ef4444" : "1px solid #e5e7eb",
+  border: selected ? "2px solid rgb(14, 165, 233)" : "1px solid #e5e7eb",
   background: "#fff",
   cursor: "pointer",
   boxShadow: selected ? "0 2px 8px rgba(239,68,68,0.2)" : "0 2px 8px rgba(0,0,0,0.06)",
@@ -714,125 +841,40 @@ const itemStyle = (selected: boolean): React.CSSProperties => ({
         }}
       >
         {/* LEWO: Twoje kolumny */}
-        <div>
-            <div
-              style={{
-                display: "grid",
-                gridAutoFlow: "column",
-                gridAutoColumns: "minmax(260px, 320px)",
-                gap: GRID_GAP,
-                overflow: "visible",      // ← pozwól wychodzić elementom w gap
-                position: "relative",     // ← porządek nakładania
-              }}
-            >
+        <div style={{ position: "relative" }}>
+          <div
+            ref={gridRef}
+            style={{
+              display: "grid",
+              gridAutoFlow: "column",
+              gridAutoColumns: "minmax(260px, 320px)",
+              gap: GRID_GAP,
+              overflow: "visible",
+              position: "relative",         
+            }}
+          >
 
             {columns.map((items, colIdx) => {
-              const parent = colIdx === 0 ? null : selections[colIdx - 1];
               const selectedId = selections[colIdx] ?? null;
 
               return (
+                <div
+                  key={colIdx}
+                  ref={(el) => { colWrapRefs.current[colIdx] = el; }}
+                  style={{ position: "relative", minWidth: 260, maxWidth: 320 }}
+                >
+                  {/* właściwy scroller (tak jak dotąd) */}
                   <div
-                    key={colIdx}
                     ref={(el) => { colRefs.current[colIdx] = el; }}
                     className="msd-col"
-                    style={{ ...columnStyle, position: "relative", zIndex: 100 + colIdx }}
+                    style={{ ...columnStyle, position: "relative", zIndex: 0 }}
                   >
 
-                  {colIdx === 0 ? (
-                    <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>
-                      Rooty
-                    </div>
-                  ) : (
-                    <div style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", marginBottom: 8, color: "#6b7280" }}>
-                      Zależności {graph.nodeLabels[parent!] ?? parent}
-                    </div>
-                  )}
+                  <div style={{ direction: "ltr" }}>
 
                   {items.length === 0 && (
                     <div style={{ fontSize: 13, color: "#6b7280" }}>Brak elementów</div>
                   )}
-
-                  {/* OVERLAY: rysuje połączenia z kolumny colIdx do colIdx+1 */}
-                  {(() => {
-                    // rodzic to zaznaczony w tej kolumnie
-                    const parentId = selections[colIdx];
-                    const nextColItems = columns[colIdx + 1];
-                    if (!parentId || !nextColItems || nextColItems.length === 0) return null;
-
-                    // Y-środek rodzica w układzie TEJ kolumny
-                    const yParent = centerYIn(colIdx, colIdx, parentId);
-                    if (yParent == null) return null;
-
-                    // Y-środki dzieci przeliczone do układu TEJ kolumny
-                    const yChildren = nextColItems
-                      .map(nid => {
-                        const y = centerYIn(colIdx, colIdx + 1, nid);
-                        return y == null ? null : { nid, y };
-                      })
-                      .filter(Boolean) as { nid: string; y: number }[];
-
-                    if (yChildren.length === 0) return null;
-
-                    const H = colContentHeight(colIdx);
-                    const W = (colRefs.current[colIdx]?.clientWidth ?? 0);
-                    const BORDER_X = W - 1;   // ~prawe 1px borderRight kolumny
-
-                    const minChildY = Math.min(...yChildren.map(v => v.y));
-                    const maxChildY = Math.max(...yChildren.map(v => v.y));
-
-                    // pień ma obejmować i rodzica, i dzieci
-                    const trunkY1 = Math.min(minChildY, yParent);
-                    const trunkY2 = Math.max(maxChildY, yParent);
-
-                    const TAP_PARENT = 12;    // poziomy „języczek” od rodzica do pnia
-                    const TAP_CHILD  = 10;    // krótka odnoga do dziecka
-                    const STROKE     = 6;     // stała grubość
-                    const COLOR      = "rgb(14, 165, 233)"; // żółty jak w przykładzie
-
-                    return (
-                      <svg
-                        width="100%"
-                        height={H}
-                        style={{ position: "absolute", inset: 0, pointerEvents: "none", overflow: "visible" }}
-                      >
-                        {/* języczek od rodzica */}
-                        <line
-                          x1={BORDER_X - TAP_PARENT}
-                          y1={yParent}
-                          x2={BORDER_X}
-                          y2={yParent}
-                          stroke={COLOR}
-                          strokeWidth={STROKE}
-                          strokeLinecap="round"
-                        />
-
-                        <line
-                          x1={BORDER_X}
-                          y1={trunkY1}
-                          x2={BORDER_X}
-                          y2={trunkY2}
-                          stroke={COLOR}
-                          strokeWidth={STROKE}
-                          strokeLinecap="round"
-                        />
-
-                        {/* odnogi do każdego dziecka */}
-                        {yChildren.map(({ y }, i) => (
-                          <line
-                            key={i}
-                            x1={BORDER_X}
-                            y1={y}
-                            x2={BORDER_X + TAP_CHILD}
-                            y2={y}
-                            stroke={COLOR}
-                            strokeWidth={STROKE}
-                            strokeLinecap="round"
-                          />
-                        ))}
-                      </svg>
-                    );
-                  })()}
-
 
                   {items.map((id) => {
                     const label = graph.nodeLabels[id] ?? id;
@@ -930,7 +972,7 @@ const itemStyle = (selected: boolean): React.CSSProperties => ({
                                 background: "#38bdf8",          // niebieski
                                 borderRadius: 999,
                                 boxShadow: "0 0 0 0.5px rgba(0,0,0,0.04)",
-                                zIndex: 999,
+                                zIndex: 0,
                                 pointerEvents: "none",
                               }}
                               title={`RPS: ${edgeMetrics.rps}`}
@@ -955,12 +997,26 @@ const itemStyle = (selected: boolean): React.CSSProperties => ({
                       </div>
                     );
                   })}
+                </div>
 
                 </div>
-              );
-            })}
-          </div>
-        </div>
+              </div>
+          );
+        })}
+      </div>
+
+      {/* GLOBALNY OVERLAY NAD SIATKĄ */}
+      <GlobalConnectors
+        gridEl={gridRef.current}
+        columns={columns}
+        selections={selections}
+        itemRefs={itemRefs}
+        colRefs={colRefs}
+        metricsByEdge={graph.metricsByEdge}   // ⬅️ NOWE
+      />
+
+
+    </div>
 
         {/* PRAWO: PANEL SZCZEGÓŁÓW */}
         <div style={{ display: "flex", flexDirection: "column", minWidth: 0 }}>
