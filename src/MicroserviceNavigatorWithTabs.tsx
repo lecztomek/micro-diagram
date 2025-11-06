@@ -1,12 +1,14 @@
 import React from "react";
-import { MicroserviceDependencyNavigator } from "./MicroserviceDependencyNavigator"; // ⬅️ Zmień ścieżkę importu na właściwą
+import { MicroserviceDependencyNavigator } from "./MicroserviceDependencyNavigator"; // ⬅️ dopasuj ścieżkę importu
 
-// Typy – importuj z Twojego pliku jeśli je eksportujesz.
-// Jeśli ServiceNode jest eksportowany, użyj: `import { ServiceNode } from "./MicroserviceDependencyNavigator";`
+// --- Typy --------------------------------------------------------------
+
+type Status = "healthy" | "degraded" | "down";
+
 export type ServiceNode = {
   id: string;
   name: string;
-  status?: "healthy" | "degraded" | "down";
+  status?: Status;
   rpm?: number;
   children?: ServiceNode[];
 };
@@ -28,6 +30,40 @@ export function groupKey(name: string, depth = 3): string {
   return parts.slice(0, Math.max(1, depth)).join(".") || "(inne)";
 }
 
+const STATUS_COLOR: Record<Status, string> = {
+  healthy: "bg-emerald-500",
+  degraded: "bg-amber-500",
+  down: "bg-red-500",
+} as const;
+
+// im wyżej, tym gorzej
+function statusRank(s: Status | undefined) {
+  return s === "down" ? 3 : s === "degraded" ? 2 : s === "healthy" ? 1 : 0;
+}
+
+function worstStatusInTree(node?: ServiceNode): Status {
+  if (!node) return "healthy";
+  let worst: Status = node.status ?? "healthy";
+  const kids = node.children ?? [];
+  for (const k of kids) {
+    const wk = worstStatusInTree(k); // zawsze Status
+    if (statusRank(wk) > statusRank(worst)) worst = wk;
+    if (worst === "down") break; // szybkie wyjście
+  }
+  return worst;
+}
+
+function worstStatusInGroup(nodes: ServiceNode[]): Status {
+  let worst: Status = "healthy";
+  for (const n of nodes) {
+    const w = worstStatusInTree(n);
+    if (statusRank(w) > statusRank(worst)) worst = w;
+    if (worst === "down") break;
+  }
+  return worst;
+}
+
+// --- Props -------------------------------------------------------------
 
 export type TabsProps = {
   data?: ServiceNode[];
@@ -50,12 +86,14 @@ export type TabsProps = {
   className?: string;
 };
 
+// --- Komponent ---------------------------------------------------------
+
 /**
  * MicroserviceNavigatorWithTabs – lekki wrapper w OSOBNYM pliku.
  *
  * - Generuje taby dynamicznie na podstawie `data` (brak twardych prefixów).
  * - Każdy root trafia do dokładnie jednego tabu – brak duplikacji.
- * - W środku używa Twojego istniejącego komponentu MicroserviceDependencyNavigator.
+ * - W środku używa Twojego komponentu MicroserviceDependencyNavigator.
  */
 export function MicroserviceNavigatorWithTabs({
   data,
@@ -89,13 +127,14 @@ export function MicroserviceNavigatorWithTabs({
   );
 
   const [active, setActive] = React.useState<string>(() => {
-    if (defaultTab && (defaultTab === allTabLabel || (defaultTab in groups))) return defaultTab;
-    return tabs[0];
+    if (defaultTab && (defaultTab === allTabLabel || defaultTab in groups)) return defaultTab;
+    return tabs[0] ?? ""; // osłona na brak tabów
   });
 
-  // Jeśli lista tabów się zmieni (np. zmiana danych), zabezpiecz aktywny tabu.
+  // Jeśli lista tabów się zmieni (np. zmiana danych), zabezpiecz aktywny tab.
   React.useEffect(() => {
-    if (!tabs.includes(active)) setActive(tabs[0]);
+    if (!tabs.includes(active)) setActive(tabs[0] ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [tabs.join("|"), active]);
 
   const rootsForActive = active === allTabLabel ? safeData : (groups[active] ?? []);
@@ -105,23 +144,40 @@ export function MicroserviceNavigatorWithTabs({
       {/* Pasek tabów */}
       <div className="mb-3 flex flex-wrap items-center gap-2 gap-y-2">
         {tabs.map((t) => {
-          const count = t === allTabLabel ? safeData.length : (groups[t]?.length ?? 0);
+          const allRoots = t === allTabLabel ? safeData : (groups[t] ?? []);
+          const count = allRoots.length;
           const isActive = t === active;
+          const worst = worstStatusInGroup(allRoots);
+          const stripe = STATUS_COLOR[worst];
+
           return (
             <button
               key={t}
               onClick={() => setActive(t)}
-              className={`whitespace-nowrap rounded-xl px-3 py-1.5 text-sm border transition-all ${
+              className={[
+                "relative inline-flex items-center rounded-xl border text-sm transition-all",
+                "px-3 py-1.5 pl-5",            // miejsce na pasek po lewej
+                "bg-white",                    // brak szarego podświetlania
                 isActive
-                  ? "bg-indigo-600 text-white border-indigo-600 shadow"
-                  : "bg-white text-neutral-800 border-black/10 hover:bg-neutral-50"
-              }`}
+                  ? "ring-2 ring-indigo-600 border-indigo-600 shadow"
+                  : "border-black/10 hover:ring-1 hover:ring-neutral-300",
+              ].join(" ")}
               title={`${t} (${count})`}
             >
-              <span className="font-medium">{t}</span>
-              <span className={`ml-2 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full text-xs ${
-                isActive ? "bg-white/20" : "bg-black/5"
-              }`}>
+              {/* pionowy pasek statusu jak w kafelkach */}
+              <span
+                aria-hidden
+                className={`${stripe} absolute inset-y-0 left-0 w-2 rounded-l-xl`}
+              />
+              <span className="font-medium whitespace-normal break-words">{t}</span>
+              <span
+                className={[
+                  "ml-2 inline-flex h-5 min-w-[20px] items-center justify-center rounded-full text-xs",
+                  isActive
+                    ? "bg-indigo-50 text-indigo-700 border border-indigo-200"
+                    : "bg-black/5 text-neutral-700",
+                ].join(" ")}
+              >
                 {count}
               </span>
             </button>
